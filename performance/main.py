@@ -16,9 +16,7 @@ if __name__ == "__main__":
         simple_function(i)
         t2 = time.time()
         times.append(t2 - t1)
-    
+
     # export as json
     with open("perf.json", "w") as f:
         json.dump({"times": times, "db_size": 0}, f)
-    
-    
