@@ -19,12 +19,12 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QVBoxLayout,
     QHBoxLayout, QSplitter, QTreeWidget, QTreeWidgetItem, QFrame,
     QScrollArea, QCheckBox, QPushButton, QSpinBox, QGroupBox, QTextEdit,
-    QMessageBox, QSizePolicy
+    QMessageBox, QSizePolicy, QShortcut
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF, QEvent
 from PyQt5.QtGui import (
     QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont, QTextCursor, 
-    QTextFormat
+    QTextFormat, QSyntaxHighlighter, QTextCharFormat, QKeySequence
 )
 
 from PIL import Image
@@ -67,6 +67,64 @@ def modified_set_mode(*args, **kwargs):
 
 
 pygame.display.set_mode = modified_set_mode
+
+
+class PythonSyntaxHighlighter(QSyntaxHighlighter):
+    """Simple Python syntax highlighter for QTextEdit"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        # Define highlighting rules
+        self.highlighting_rules = []
+        
+        # Keyword format
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(QColor("#0000FF"))  # Blue
+        keyword_format.setFontWeight(QFont.Bold)
+        keywords = [
+            'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await',
+            'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except',
+            'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is',
+            'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return',
+            'try', 'while', 'with', 'yield'
+        ]
+        for word in keywords:
+            pattern = f"\\b{word}\\b"
+            self.highlighting_rules.append((pattern, keyword_format))
+        
+        # String format (single and double quotes)
+        string_format = QTextCharFormat()
+        string_format.setForeground(QColor("#008000"))  # Green
+        self.highlighting_rules.append((r'"[^"\\]*(\\.[^"\\]*)*"', string_format))
+        self.highlighting_rules.append((r"'[^'\\]*(\\.[^'\\]*)*'", string_format))
+        
+        # Comment format
+        comment_format = QTextCharFormat()
+        comment_format.setForeground(QColor("#808080"))  # Gray
+        comment_format.setFontItalic(True)
+        self.highlighting_rules.append((r"#[^\n]*", comment_format))
+        
+        # Number format
+        number_format = QTextCharFormat()
+        number_format.setForeground(QColor("#FF8000"))  # Orange
+        self.highlighting_rules.append((r"\b[0-9]+\.?[0-9]*\b", number_format))
+        
+        # Function/class definition format
+        function_format = QTextCharFormat()
+        function_format.setForeground(QColor("#0080FF"))  # Light blue
+        function_format.setFontWeight(QFont.Bold)
+        self.highlighting_rules.append((r"\b(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", function_format))
+    
+    def highlightBlock(self, text):
+        """Apply syntax highlighting to the given text block"""
+        import re
+        
+        for pattern, format in self.highlighting_rules:
+            for match in re.finditer(pattern, text):
+                start = match.start()
+                length = match.end() - start
+                self.setFormat(start, length, format)
 
 
 class TwoHandleRangeQt(QWidget):
@@ -459,9 +517,16 @@ class GameExplorerQt(QMainWindow):
         self.code_editor.setFont(QFont("Courier", 10))
         self.code_editor.setAcceptRichText(False)  # Plain text only for editing
         
+        # Apply syntax highlighter
+        self.syntax_highlighter = PythonSyntaxHighlighter(self.code_editor.document())
+        
         # Track modifications
         self.code_editor.textChanged.connect(self._on_code_editor_changed)
         self.file_modified = False
+        
+        # Add Ctrl+S keyboard shortcut for saving
+        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self.code_editor)
+        save_shortcut.activated.connect(self._save_current_file)
         
         code_editor_layout.addWidget(self.code_editor)
         
@@ -553,37 +618,39 @@ class GameExplorerQt(QMainWindow):
             
             # Create frame with indent for branches
             session_name = session_data.get('name', f"Session {session_id}")
-            session_frame = QGroupBox(f"{session_name} ({len(calls)} calls)")
+            
+            # Build compact title with essential info
+            title = f"{session_name} ({len(calls)} calls)"
+            if 'session' in session_data:
+                session_info = session_data['session']
+                title += f" - {session_info.start_time.strftime('%H:%M:%S')}"
+            
+            session_frame = QGroupBox(title)
             session_layout = QVBoxLayout(session_frame)
+            session_layout.setSpacing(2)  # Reduce spacing between elements
+            session_layout.setContentsMargins(5, 5, 5, 5)  # Tighter margins
             
             # Add margin for branches
             if is_branch:
                 session_frame.setStyleSheet("QGroupBox { margin-left: 20px; }")
             
-            # Session info with branch information
-            info_text = ""
-            if 'session' in session_data:
-                session_info = session_data['session']
-                info_text = f"Started: {session_info.start_time.strftime('%H:%M:%S')}"
-                if session_info.description:
-                    info_text += f" - {session_info.description}"
-            
+            # Show branch info more compactly if applicable
             if is_branch:
                 parent_id = rel['parent_session_id']
                 parent_name = self.sessions_data[parent_id].get('name', f"Session {parent_id}") if parent_id in self.sessions_data else f"Session {parent_id}"
-                info_text += f" | Branches from {parent_name}"
+                branch_info = f"↳ Branches from {parent_name}"
                 if branch_point_index is not None:
-                    info_text += f" at frame {branch_point_index + 1}"
+                    branch_info += f" at frame {branch_point_index + 1}"
+                
+                branch_label = QLabel(branch_info)
+                branch_label.setStyleSheet("QLabel { font-size: 9pt; color: #666; }")
+                session_layout.addWidget(branch_label)
             
-            if info_text:
-                info_label = QLabel(info_text)
-                info_label.setWordWrap(True)
-                session_layout.addWidget(info_label)
-            
-            # Checkbox frame for Compare and Stroboscopic
+            # Checkbox frame for Compare
             checkbox_frame = QWidget()
             checkbox_layout = QHBoxLayout(checkbox_frame)
             checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            checkbox_layout.setSpacing(5)
             
             # Compare checkbox
             if session_id not in self.comparison_checkboxes:
@@ -597,7 +664,29 @@ class GameExplorerQt(QMainWindow):
             session_layout.addWidget(checkbox_frame)
             
             # Set fixed maximum height for session frame to prevent expansion
-            session_frame.setMaximumHeight(200)
+            session_frame.setMaximumHeight(180)  # Reduced from 200
+            
+            # Create slider container for proper alignment with parent session
+            slider_container = QWidget()
+            slider_layout = QHBoxLayout(slider_container)
+            slider_layout.setContentsMargins(0, 0, 0, 0)
+            slider_layout.setSpacing(0)
+            
+            # Add left padding for branch sessions to align with parent's branch point
+            if is_branch and branch_point_index is not None:
+                # Get parent session to calculate offset
+                parent_id = rel.get('parent_session_id')
+                if parent_id in self.sessions_data:
+                    parent_calls = self.sessions_data[parent_id]['calls']
+                    if len(parent_calls) > 0:
+                        # Calculate proportional offset based on branch point
+                        # This aligns the start of child slider with the branch point in parent
+                        offset_ratio = branch_point_index / len(parent_calls)
+                        # Use a fixed width approximation for slider (e.g., 400px typical slider width)
+                        offset_pixels = int(offset_ratio * 400)
+                        spacer = QWidget()
+                        spacer.setFixedWidth(offset_pixels)
+                        slider_layout.addWidget(spacer)
             
             # Slider
             slider = QSlider(Qt.Horizontal)
@@ -608,7 +697,26 @@ class GameExplorerQt(QMainWindow):
             slider.setTickInterval(max(1, len(calls) // 10))
             slider.valueChanged.connect(lambda val, sid=session_id: self._on_slider_change(sid, val))
             
-            session_layout.addWidget(slider)
+            slider_layout.addWidget(slider)
+            session_layout.addWidget(slider_container)
+            
+            # Range selector with similar offset
+            range_container = QWidget()
+            range_layout = QHBoxLayout(range_container)
+            range_layout.setContentsMargins(0, 0, 0, 0)
+            range_layout.setSpacing(0)
+            
+            # Add same offset for range selector
+            if is_branch and branch_point_index is not None:
+                parent_id = rel.get('parent_session_id')
+                if parent_id in self.sessions_data:
+                    parent_calls = self.sessions_data[parent_id]['calls']
+                    if len(parent_calls) > 0:
+                        offset_ratio = branch_point_index / len(parent_calls)
+                        offset_pixels = int(offset_ratio * 400)
+                        spacer = QWidget()
+                        spacer.setFixedWidth(offset_pixels)
+                        range_layout.addWidget(spacer)
             
             # Range selector
             range_widget = TwoHandleRangeQt(
@@ -621,7 +729,8 @@ class GameExplorerQt(QMainWindow):
             range_widget.value_changed.connect(
                 lambda handle, val, sid=session_id: self._on_range_changed(sid, handle, val)
             )
-            session_layout.addWidget(range_widget)
+            range_layout.addWidget(range_widget)
+            session_layout.addWidget(range_container)
 
             range_label = QLabel(f"Range: 1 - {len(calls)}")
             session_layout.addWidget(range_label)
@@ -1477,7 +1586,7 @@ class GameExplorerQt(QMainWindow):
     def _save_current_file(self):
         """Save the currently edited file"""
         if not self.current_source_file:
-            QMessageBox.warning(self, "Save Error", "No file is currently loaded")
+            self.status_label.setText("No file is currently loaded")
             return
         
         try:
@@ -1488,9 +1597,9 @@ class GameExplorerQt(QMainWindow):
             self.file_modified = False
             self.save_button.setEnabled(False)
             self._update_code_editor_title()
-            self.status_label.setText(f"Saved: {os.path.basename(self.current_source_file)}")
-            QMessageBox.information(self, "Save Successful", f"File saved: {self.current_source_file}")
+            self.status_label.setText(f"✓ Saved: {os.path.basename(self.current_source_file)}")
         except Exception as e:
+            self.status_label.setText(f"✗ Save failed: {e}")
             QMessageBox.critical(self, "Save Error", f"Failed to save file: {e}")
     
     def run(self):
