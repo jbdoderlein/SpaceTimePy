@@ -14,6 +14,7 @@ import io
 import os
 import sys
 from typing import Any, TypedDict
+import re  # For syntax highlighting regex
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QVBoxLayout,
@@ -118,8 +119,6 @@ class PythonSyntaxHighlighter(QSyntaxHighlighter):
     
     def highlightBlock(self, text):
         """Apply syntax highlighting to the given text block"""
-        import re
-        
         for pattern, format in self.highlighting_rules:
             for match in re.finditer(pattern, text):
                 start = match.start()
@@ -307,6 +306,7 @@ class GameExplorerQt(QMainWindow):
         self.MAX_COLLECTION_EXPANSION_SIZE = 20  # Max items in list/dict to expand
         self.MAX_KEY_LENGTH = 50  # Max length for dict keys
         self.MAX_STRING_DISPLAY_LENGTH = 100  # Max string length before truncation
+        self.SLIDER_WIDGET_WIDTH = 400  # Approximate slider width for offset calculations
         
         # Range selection per session
         self.range_start = {}
@@ -317,6 +317,21 @@ class GameExplorerQt(QMainWindow):
         
         # Initialize database
         self._init_database()
+    
+    def _calculate_branch_offset(self, branch_point_index: int, parent_calls_count: int) -> int:
+        """Calculate pixel offset for branch session sliders based on branch point.
+        
+        Args:
+            branch_point_index: Index in parent session where branch occurs
+            parent_calls_count: Total number of calls in parent session
+            
+        Returns:
+            Pixel offset to apply to slider for visual alignment
+        """
+        if parent_calls_count == 0:
+            return 0
+        offset_ratio = branch_point_index / parent_calls_count
+        return int(offset_ratio * self.SLIDER_WIDGET_WIDTH)
     
     def _init_database(self):
         """Initialize database connection and load sessions"""
@@ -674,16 +689,11 @@ class GameExplorerQt(QMainWindow):
             
             # Add left padding for branch sessions to align with parent's branch point
             if is_branch and branch_point_index is not None:
-                # Get parent session to calculate offset
                 parent_id = rel.get('parent_session_id')
                 if parent_id in self.sessions_data:
                     parent_calls = self.sessions_data[parent_id]['calls']
-                    if len(parent_calls) > 0:
-                        # Calculate proportional offset based on branch point
-                        # This aligns the start of child slider with the branch point in parent
-                        offset_ratio = branch_point_index / len(parent_calls)
-                        # Use a fixed width approximation for slider (e.g., 400px typical slider width)
-                        offset_pixels = int(offset_ratio * 400)
+                    offset_pixels = self._calculate_branch_offset(branch_point_index, len(parent_calls))
+                    if offset_pixels > 0:
                         spacer = QWidget()
                         spacer.setFixedWidth(offset_pixels)
                         slider_layout.addWidget(spacer)
@@ -711,9 +721,8 @@ class GameExplorerQt(QMainWindow):
                 parent_id = rel.get('parent_session_id')
                 if parent_id in self.sessions_data:
                     parent_calls = self.sessions_data[parent_id]['calls']
-                    if len(parent_calls) > 0:
-                        offset_ratio = branch_point_index / len(parent_calls)
-                        offset_pixels = int(offset_ratio * 400)
+                    offset_pixels = self._calculate_branch_offset(branch_point_index, len(parent_calls))
+                    if offset_pixels > 0:
                         spacer = QWidget()
                         spacer.setFixedWidth(offset_pixels)
                         range_layout.addWidget(spacer)
