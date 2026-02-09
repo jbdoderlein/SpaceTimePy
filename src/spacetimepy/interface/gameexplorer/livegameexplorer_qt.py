@@ -197,7 +197,7 @@ class PythonSyntaxHighlighter(QSyntaxHighlighter):
             'True', 'try', 'while', 'with', 'yield', 'async', 'await'
         ]
         for keyword in keywords:
-            pattern = QRegExp(f'\\b{keyword}\\b')
+            pattern = QRegExp(rf'\b{keyword}\b')
             self.highlighting_rules.append((pattern, keyword_format))
         
         # Built-in functions
@@ -210,42 +210,42 @@ class PythonSyntaxHighlighter(QSyntaxHighlighter):
             'open', 'print', 'range', 'set', 'str', 'sum', 'tuple', 'type', 'zip'
         ]
         for builtin in builtins:
-            pattern = QRegExp(f'\\b{builtin}\\b')
+            pattern = QRegExp(rf'\b{builtin}\b')
             self.highlighting_rules.append((pattern, builtin_format))
         
         # Strings (double-quoted)
         string_format = QTextCharFormat()
         string_format.setForeground(QColor('#A31515'))
-        self.highlighting_rules.append((QRegExp('"[^"\\\\]*(\\\\.[^"\\\\]*)*"'), string_format))
+        self.highlighting_rules.append((QRegExp(r'"[^"\\]*(\\.[^"\\]*)*"'), string_format))
         
         # Strings (single-quoted)
-        self.highlighting_rules.append((QRegExp("'[^'\\\\]*(\\\\.[^'\\\\]*)*'"), string_format))
+        self.highlighting_rules.append((QRegExp(r"'[^'\\]*(\\.[^'\\]*)*'"), string_format))
         
         # Comments
         comment_format = QTextCharFormat()
         comment_format.setForeground(QColor('#008000'))
         comment_format.setFontItalic(True)
-        self.highlighting_rules.append((QRegExp('#[^\n]*'), comment_format))
+        self.highlighting_rules.append((QRegExp(r'#[^\n]*'), comment_format))
         
         # Numbers
         number_format = QTextCharFormat()
         number_format.setForeground(QColor('#098658'))
-        self.highlighting_rules.append((QRegExp('\\b[0-9]+\\b'), number_format))
+        self.highlighting_rules.append((QRegExp(r'\b[0-9]+\b'), number_format))
         
-        # Function/method definitions
-        function_format = QTextCharFormat()
-        function_format.setForeground(QColor('#795E26'))
-        function_format.setFontWeight(QFont.Bold)
-        self.highlighting_rules.append((QRegExp('\\bdef\\s+([A-Za-z_][A-Za-z0-9_]*)'), function_format))
+        # Store special patterns for function and class names
+        self.function_pattern = QRegExp(r'\bdef\s+([A-Za-z_][A-Za-z0-9_]*)')
+        self.function_format = QTextCharFormat()
+        self.function_format.setForeground(QColor('#795E26'))
+        self.function_format.setFontWeight(QFont.Bold)
         
-        # Class definitions
-        class_format = QTextCharFormat()
-        class_format.setForeground(QColor('#267F99'))
-        class_format.setFontWeight(QFont.Bold)
-        self.highlighting_rules.append((QRegExp('\\bclass\\s+([A-Za-z_][A-Za-z0-9_]*)'), class_format))
+        self.class_pattern = QRegExp(r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)')
+        self.class_format = QTextCharFormat()
+        self.class_format.setForeground(QColor('#267F99'))
+        self.class_format.setFontWeight(QFont.Bold)
     
     def highlightBlock(self, text):
         """Apply syntax highlighting to the given text block"""
+        # Apply general rules first
         for pattern, format_style in self.highlighting_rules:
             expression = QRegExp(pattern)
             index = expression.indexIn(text)
@@ -253,6 +253,26 @@ class PythonSyntaxHighlighter(QSyntaxHighlighter):
                 length = expression.matchedLength()
                 self.setFormat(index, length, format_style)
                 index = expression.indexIn(text, index + length)
+        
+        # Handle function definitions specially - only highlight the name
+        index = self.function_pattern.indexIn(text)
+        while index >= 0:
+            # Cap(1) contains the function name (first captured group)
+            length = len(self.function_pattern.cap(1))
+            # Calculate position: def + whitespace + name
+            name_start = index + text[index:].index(self.function_pattern.cap(1))
+            self.setFormat(name_start, length, self.function_format)
+            index = self.function_pattern.indexIn(text, index + 1)
+        
+        # Handle class definitions specially - only highlight the name
+        index = self.class_pattern.indexIn(text)
+        while index >= 0:
+            # Cap(1) contains the class name (first captured group)
+            length = len(self.class_pattern.cap(1))
+            # Calculate position: class + whitespace + name
+            name_start = index + text[index:].index(self.class_pattern.cap(1))
+            self.setFormat(name_start, length, self.class_format)
+            index = self.class_pattern.indexIn(text, index + 1)
 
 
 class GameExplorerQt(QMainWindow):
@@ -639,11 +659,21 @@ class GameExplorerQt(QMainWindow):
             # Ensure start <= end
             if value > self.range_end[session_id]:
                 self.range_end[session_id] = value
+                # Update the range widget to reflect the change
+                slider_info = self.session_sliders.get(session_id)
+                if slider_info and 'range_widget' in slider_info:
+                    range_widget = slider_info['range_widget']
+                    range_widget.set_values(self.range_start[session_id], self.range_end[session_id])
         else:
             self.range_end[session_id] = value
             # Ensure end >= start
             if value < self.range_start[session_id]:
                 self.range_start[session_id] = value
+                # Update the range widget to reflect the change
+                slider_info = self.session_sliders.get(session_id)
+                if slider_info and 'range_widget' in slider_info:
+                    range_widget = slider_info['range_widget']
+                    range_widget.set_values(self.range_start[session_id], self.range_end[session_id])
 
         self._update_range_label(session_id)
         
