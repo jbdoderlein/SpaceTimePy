@@ -45,7 +45,7 @@ chlorophyll = { git = "https://github.com/jbdoderlein/chlorophyll" }
 # Optional groups to install only what you need. Example: `pip install .[game]`
 
 game = [
-    "pygame>=2.6.1",
+    "pygame",
     "chlorophyll",
     "sv-ttk>=2.6.1",
     "pillow>=11.2.1",

@@ -1,0 +1,53 @@
+@startuml classes
+set namespaceSeparator none
+record "Code"  {
+  path : str
+  content : str
+  module : str
+}
+
+record "FunctionCall"  {
+  name : str
+  location : str
+  metadata : dict[str, Any]
+}
+
+record "Session"  {
+  name : str
+  metadata : dict[str, Any]
+}
+
+record "ObjectIdentity"  {
+  id : int
+  identity_hash : str
+  name : str
+}
+
+record "StackSnapshot" {
+  location : str
+}
+
+record "StoredObject" {
+  name : str
+  hash : str
+  type : str
+  data : bytes | str
+}
+
+FunctionCall --> "0..1" FunctionCall : parent_call
+
+FunctionCall --> "1" Code : code
+StackSnapshot --> "1" Code : code
+
+StackSnapshot "0..*" -l-> "1" FunctionCall : function_call
+FunctionCall "0..*" -l-> "1" Session : session
+FunctionCall "0..*" --> "0..*" StoredObject : locals
+FunctionCall "0..*" --> "0..*" StoredObject : globals
+FunctionCall  --> "0..1" StoredObject : return_value
+
+StackSnapshot "0..*" --> "0..*" StoredObject : locals
+StackSnapshot "0..*" --> "0..*" StoredObject : globals
+
+StoredObject "1..*" --> "1" ObjectIdentity : identity
+
+@enduml
