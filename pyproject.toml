@@ -30,6 +30,7 @@ dependencies = [
 web-spacetimepy = "spacetimepy.interface.web.explorer:main"
 game-explorer = "spacetimepy.interface.gameexplorer.gameexplorer:main"
 live-game-explorer = "spacetimepy.interface.gameexplorer.livegameexplorer:main"
+live-game-explorer-qt = "spacetimepy.interface.gameexplorer.livegameexplorer_qt:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/spacetimepy"]
@@ -49,6 +50,13 @@ game = [
     "chlorophyll",
     "sv-ttk>=2.6.1",
     "pillow>=11.2.1",
+]
+game-qt = [
+    "pygame",
+    "chlorophyll",
+    "PyQt5>=5.15.0",
+    "pillow>=11.2.1",
+    "pygments>=2.0.0",
 ]
 visualization = [
     "matplotlib>=3.10.3",
