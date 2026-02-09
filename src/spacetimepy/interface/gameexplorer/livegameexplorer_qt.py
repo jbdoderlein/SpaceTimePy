@@ -824,21 +824,37 @@ class GameExplorerQt(QMainWindow):
         current_call = calls[self.current_call_index]
         call_data = self._get_call_data(current_call)
         
-        # Update image
+        # Get comparison data if comparison mode is active
+        comparison_call_data = None
+        if self.comparison_session_id and self.comparison_session_id != self.current_session_id:
+            comparison_call_data = self._get_comparison_call_data(self.current_session_id, self.current_call_index)
+        
+        # Update image with optional comparison overlay
         if call_data and self.image_metadata_key in call_data.get('metadata', {}):
             image = self._decode_image(call_data['metadata'][self.image_metadata_key])
             if image:
-                self._display_image(image)
+                # Get comparison image if available
+                comparison_image = None
+                if comparison_call_data and self.image_metadata_key in comparison_call_data.get('metadata', {}):
+                    comparison_image = self._decode_image(comparison_call_data['metadata'][self.image_metadata_key])
+                
+                self._display_image(image, comparison_image)
         
         # Update info label
         info_text = f"Session: {self.current_session_id} | Call: {self.current_call_index + 1}/{len(calls)}\n"
         info_text += f"Function: {current_call.function}\n"
         if current_call.file:
             info_text += f"File: {current_call.file}:{current_call.line}"
+        
+        # Add comparison info if active
+        if self.comparison_session_id and self.comparison_session_id in self.sessions_data:
+            comparison_name = self.sessions_data[self.comparison_session_id].get('name', f"Session {self.comparison_session_id}")
+            info_text += f"\nComparing with: {comparison_name}"
+        
         self.info_label.setText(info_text)
         
-        # Update variables tree
-        self._update_variables_display(call_data)
+        # Update variables tree with comparison data
+        self._update_variables_display(call_data, comparison_call_data)
 
         # Update code editor
         self._update_code_editor(current_call)
@@ -971,21 +987,101 @@ class GameExplorerQt(QMainWindow):
         if not call_data:
             return
         
+        # Get comparison variables if available
+        comparison_variables = {}
+        if comparison_call_data:
+            comparison_variables = {
+                'locals': comparison_call_data.get('locals', {}),
+                'globals': comparison_call_data.get('globals', {})
+            }
+        
         # Add locals
         if call_data.get('locals'):
             locals_root = QTreeWidgetItem(self.variables_tree, ['Locals', '', ''])
             locals_root.setExpanded(True)
             for key, value in call_data['locals'].items():
-                item = QTreeWidgetItem(locals_root, [str(key), str(value), ''])
+                comp_value = comparison_variables.get('locals', {}).get(key) if comparison_call_data else None
+                self._add_variable_to_tree(locals_root, key, value, comp_value)
         
         # Add globals (filtered)
         if call_data.get('globals'):
             globals_root = QTreeWidgetItem(self.variables_tree, ['Globals', '', ''])
             for key, value in call_data['globals'].items():
                 if not key.startswith('__'):
-                    item = QTreeWidgetItem(globals_root, [str(key), str(value), ''])
+                    comp_value = comparison_variables.get('globals', {}).get(key) if comparison_call_data else None
+                    self._add_variable_to_tree(globals_root, key, value, comp_value)
 
         self._restore_tree_expanded()
+    
+    def _add_variable_to_tree(self, parent, name: str, value: Any, comparison_value: Any = None):
+        """Recursively add a variable and its sub-fields to the tree"""
+        if not self.variables_tree:
+            return
+
+        # Format the value for display
+        value_str = self._format_value_for_display(value)
+        comparison_str = self._format_value_for_display(comparison_value) if comparison_value is not None else ""
+
+        # Check if values are different for color coding
+        values_different = False
+        if comparison_value is not None:
+            try:
+                # Compare the actual values, not just their string representations
+                values_different = value != comparison_value
+            except Exception:
+                # If comparison fails (e.g., different types), consider them different
+                values_different = True
+
+        # Insert the main item
+        item = QTreeWidgetItem(parent, [name, value_str, comparison_str])
+
+        # Apply color if values are different
+        if values_different:
+            # Set green color for different values
+            item.setForeground(1, QColor('green'))
+
+        # Add sub-fields if the value has interesting attributes
+        if hasattr(value, '__dict__') and value.__dict__:
+            for attr_name, attr_value in value.__dict__.items():
+                if not attr_name.startswith('_'):  # Skip private attributes
+                    comp_attr_value = None
+                    if comparison_value is not None and hasattr(comparison_value, '__dict__'):
+                        comp_attr_value = getattr(comparison_value, attr_name, None)
+                    self._add_variable_to_tree(item, attr_name, attr_value, comp_attr_value)
+        elif isinstance(value, dict) and len(value) < 20:  # Limit dict expansion
+            for key, val in value.items():
+                key_str = str(key)
+                if len(key_str) < 50:  # Limit key length
+                    comp_val = None
+                    if isinstance(comparison_value, dict):
+                        comp_val = comparison_value.get(key, None)
+                    self._add_variable_to_tree(item, f'[{key_str}]', val, comp_val)
+        elif isinstance(value, (list, tuple)) and len(value) < 20:  # Limit list expansion
+            for i, val in enumerate(value):
+                comp_val = None
+                if isinstance(comparison_value, (list, tuple)) and i < len(comparison_value):
+                    comp_val = comparison_value[i]
+                self._add_variable_to_tree(item, f'[{i}]', val, comp_val)
+    
+    def _format_value_for_display(self, value: Any) -> str:
+        """Format a value for display in the tree"""
+        try:
+            if value is None:
+                return 'None'
+            if isinstance(value, str):
+                if len(value) > 100:
+                    return f'"{value[:100]}..."'
+                return f'"{value}"'
+            if isinstance(value, (int, float, bool)):
+                return str(value)
+            if isinstance(value, (list, tuple)):
+                return f'{type(value).__name__}[{len(value)}]'
+            if isinstance(value, dict):
+                return f'dict[{len(value)}]'
+            # For other objects, show type and basic info
+            return f'<{type(value).__name__}>'
+        except Exception:
+            return '<error>'
 
     def _snapshot_tree_expanded(self):
         if not self.variables_tree:
