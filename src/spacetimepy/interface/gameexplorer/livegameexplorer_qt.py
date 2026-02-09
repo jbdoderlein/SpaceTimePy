@@ -134,8 +134,8 @@ class TwoHandleRangeQt(QWidget):
     value_changed = pyqtSignal(str, int)  # handle_name, value
     
     def __init__(self, parent=None, min_val: int = 0, max_val: int = 100,
-                 start: int = 0, end: int = 100, width: int = 400,
-                 height: int = 36, handle_radius: int = 6):
+                 start: int = 0, end: int = 100, width: int | None = None,
+                 height: int = 36, handle_radius: int = 6, fixed_width: bool = False):
         super().__init__(parent)
         self.min_val = min_val
         self.max_val = max_val
@@ -144,26 +144,31 @@ class TwoHandleRangeQt(QWidget):
         if self.start > self.end:
             self.start, self.end = self.end, self.start
         
-        self.widget_width = width
-        self.widget_height = height
         self.handle_radius = handle_radius
         self._dragging = None  # 'start' or 'end' or None
         self._pad_x = 10
         self._track_y = height // 2
-        
-        self.setMinimumSize(width, height)
+
+        if width is not None:
+            self.setMinimumWidth(width)
+            if fixed_width:
+                self.setFixedWidth(width)
+        self.setMinimumHeight(height)
         self.setMaximumHeight(height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     
     def _val_to_x(self, val: int) -> int:
         span = max(1, self.max_val - self.min_val)
         frac = (val - self.min_val) / span
+        width = max(1, self.width())
         left = self._pad_x
-        right = self.widget_width - self._pad_x
+        right = width - self._pad_x
         return int(left + frac * (right - left))
     
     def _x_to_val(self, x: int) -> int:
+        width = max(1, self.width())
         left = self._pad_x
-        right = self.widget_width - self._pad_x
+        right = width - self._pad_x
         frac = (x - left) / max(1, (right - left))
         val = int(round(self.min_val + frac * (self.max_val - self.min_val)))
         return max(self.min_val, min(self.max_val, val))
@@ -221,9 +226,11 @@ class TwoHandleRangeQt(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         
+        width = max(1, self.width())
+        height = max(1, self.height())
         left = self._pad_x
-        right = self.widget_width - self._pad_x
-        y = self._track_y
+        right = width - self._pad_x
+        y = height // 2
         
         # Draw track background
         pen = QPen(QColor('#d0d0d0'), 8, Qt.SolidLine, Qt.RoundCap)
@@ -306,7 +313,9 @@ class GameExplorerQt(QMainWindow):
         self.MAX_COLLECTION_EXPANSION_SIZE = 20  # Max items in list/dict to expand
         self.MAX_KEY_LENGTH = 50  # Max length for dict keys
         self.MAX_STRING_DISPLAY_LENGTH = 100  # Max string length before truncation
-        self.SLIDER_WIDGET_WIDTH = 400  # Approximate slider width for offset calculations
+        self.SLIDER_WIDGET_WIDTH = 400  # Default slider width for non-branch sessions
+        self.BRANCH_SLIDER_BASE_WIDTH = 400  # Base width for branch alignment calculations
+        self.BRANCH_SLIDER_MIN_WIDTH = 100  # Minimum width for branch sliders
         
         # Range selection per session
         self.range_start = {}
@@ -318,20 +327,34 @@ class GameExplorerQt(QMainWindow):
         # Initialize database
         self._init_database()
     
-    def _calculate_branch_offset(self, branch_point_index: int, parent_calls_count: int) -> int:
-        """Calculate pixel offset for branch session sliders based on branch point.
-        
+    def _calculate_branch_slider_geometry(
+        self,
+        branch_point_index: int,
+        parent_calls_count: int,
+        child_calls_count: int,
+        total_width: int,
+    ) -> tuple[int, int]:
+        """Calculate pixel offset and width for branch sliders.
+
         Args:
             branch_point_index: Index in parent session where branch occurs
             parent_calls_count: Total number of calls in parent session
-            
+            child_calls_count: Total number of calls in branch session
+
         Returns:
-            Pixel offset to apply to slider for visual alignment
+            (offset_pixels, slider_width)
         """
-        if parent_calls_count == 0:
-            return 0
+        if parent_calls_count <= 0:
+            return 0, max(self.BRANCH_SLIDER_MIN_WIDTH, self.SLIDER_WIDGET_WIDTH)
+
+        if total_width <= 0:
+            total_width = self.BRANCH_SLIDER_BASE_WIDTH
         offset_ratio = branch_point_index / parent_calls_count
-        return int(offset_ratio * self.SLIDER_WIDGET_WIDTH)
+        width_ratio = child_calls_count / parent_calls_count
+        offset_pixels = int(total_width * offset_ratio)
+        slider_width = int(total_width * width_ratio)
+        slider_width = max(slider_width, self.BRANCH_SLIDER_MIN_WIDTH)
+        return offset_pixels, slider_width
     
     def _init_database(self):
         """Initialize database connection and load sessions"""
@@ -599,6 +622,8 @@ class GameExplorerQt(QMainWindow):
         self.sliders_frame = QWidget()
         self.sliders_layout = QVBoxLayout(self.sliders_frame)
         sliders_scroll.setWidget(self.sliders_frame)
+        # push element attop of frame
+        self.sliders_layout.addStretch(1)
         
         bottom_layout.addWidget(sliders_scroll)
         
@@ -607,6 +632,8 @@ class GameExplorerQt(QMainWindow):
         
         # Create session sliders
         self._create_session_sliders()
+
+        QTimer.singleShot(0, self._update_branch_slider_geometry)
 
         # Populate tracked functions
         self._setup_tracked_functions()
@@ -643,11 +670,9 @@ class GameExplorerQt(QMainWindow):
             session_frame = QGroupBox(title)
             session_layout = QVBoxLayout(session_frame)
             session_layout.setSpacing(2)  # Reduce spacing between elements
-            session_layout.setContentsMargins(5, 5, 5, 5)  # Tighter margins
+            session_layout.setContentsMargins(10, 10, 10, 10)  # Tighter margins
             
-            # Add margin for branches
-            if is_branch:
-                session_frame.setStyleSheet("QGroupBox { margin-left: 20px; }")
+            # Keep groupbox aligned; branch offset is handled by slider geometry
             
             # Show branch info more compactly if applicable
             if is_branch:
@@ -679,24 +704,24 @@ class GameExplorerQt(QMainWindow):
             session_layout.addWidget(checkbox_frame)
             
             # Set fixed maximum height for session frame to prevent expansion
-            session_frame.setMaximumHeight(180)  # Reduced from 200
+            session_frame.setMaximumHeight(200)  # Reduced from 200
             
             # Create slider container for proper alignment with parent session
             slider_container = QWidget()
             slider_layout = QHBoxLayout(slider_container)
             slider_layout.setContentsMargins(0, 0, 0, 0)
             slider_layout.setSpacing(0)
+            slider_layout.setAlignment(Qt.AlignLeft)  # Align to left to allow proper offset for branches
             
             # Add left padding for branch sessions to align with parent's branch point
+            slider_width = self.SLIDER_WIDGET_WIDTH
+            slider_spacer = None
             if is_branch and branch_point_index is not None:
                 parent_id = rel.get('parent_session_id')
                 if parent_id in self.sessions_data:
-                    parent_calls = self.sessions_data[parent_id]['calls']
-                    offset_pixels = self._calculate_branch_offset(branch_point_index, len(parent_calls))
-                    if offset_pixels > 0:
-                        spacer = QWidget()
-                        spacer.setFixedWidth(offset_pixels)
-                        slider_layout.addWidget(spacer)
+                    slider_spacer = QWidget()
+                    slider_spacer.setFixedWidth(0)
+                    slider_layout.addWidget(slider_spacer)
             
             # Slider
             slider = QSlider(Qt.Horizontal)
@@ -706,6 +731,9 @@ class GameExplorerQt(QMainWindow):
             slider.setTickPosition(QSlider.TicksBelow)
             slider.setTickInterval(max(1, len(calls) // 10))
             slider.valueChanged.connect(lambda val, sid=session_id: self._on_slider_change(sid, val))
+            slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            if is_branch and branch_point_index is not None:
+                slider.setFixedWidth(slider_width)
             
             slider_layout.addWidget(slider)
             session_layout.addWidget(slider_container)
@@ -715,17 +743,17 @@ class GameExplorerQt(QMainWindow):
             range_layout = QHBoxLayout(range_container)
             range_layout.setContentsMargins(0, 0, 0, 0)
             range_layout.setSpacing(0)
+            range_layout.setAlignment(Qt.AlignLeft)  # Align to left for proper branch offset
+            
             
             # Add same offset for range selector
+            range_spacer = None
             if is_branch and branch_point_index is not None:
                 parent_id = rel.get('parent_session_id')
                 if parent_id in self.sessions_data:
-                    parent_calls = self.sessions_data[parent_id]['calls']
-                    offset_pixels = self._calculate_branch_offset(branch_point_index, len(parent_calls))
-                    if offset_pixels > 0:
-                        spacer = QWidget()
-                        spacer.setFixedWidth(offset_pixels)
-                        range_layout.addWidget(spacer)
+                    range_spacer = QWidget()
+                    range_spacer.setFixedWidth(0)
+                    range_layout.addWidget(range_spacer)
             
             # Range selector
             range_widget = TwoHandleRangeQt(
@@ -733,7 +761,8 @@ class GameExplorerQt(QMainWindow):
                 max_val=len(calls) - 1,
                 start=0,
                 end=len(calls) - 1,
-                width=400
+                width=slider_width if (is_branch and branch_point_index is not None) else None,
+                fixed_width=bool(is_branch and branch_point_index is not None)
             )
             range_widget.value_changed.connect(
                 lambda handle, val, sid=session_id: self._on_range_changed(sid, handle, val)
@@ -751,6 +780,12 @@ class GameExplorerQt(QMainWindow):
                 'slider': slider,
                 'range_widget': range_widget,
                 'range_label': range_label,
+                'slider_spacer': slider_spacer,
+                'range_spacer': range_spacer,
+                'is_branch': is_branch,
+                'parent_id': rel.get('parent_session_id'),
+                'branch_point_index': branch_point_index,
+                'calls_len': len(calls),
                 'frame': session_frame
             }
             
@@ -768,6 +803,54 @@ class GameExplorerQt(QMainWindow):
         self._sync_child_sliders(session_id, value)
         
         self._update_display()
+
+    def _update_branch_slider_geometry(self):
+        """Align branch sliders based on actual parent slider width."""
+        for session_id, info in self.session_sliders.items():
+            if not info.get('is_branch'):
+                continue
+
+            parent_id = info.get('parent_id')
+            branch_point_index = info.get('branch_point_index')
+            if parent_id is None or branch_point_index is None:
+                continue
+
+            parent_info = self.session_sliders.get(parent_id)
+            if not parent_info:
+                continue
+
+            parent_slider = parent_info.get('slider')
+            if not parent_slider:
+                continue
+
+            parent_width = parent_slider.width()
+            parent_calls = self.sessions_data.get(parent_id, {}).get('calls', [])
+            offset_pixels, slider_width = self._calculate_branch_slider_geometry(
+                branch_point_index,
+                len(parent_calls),
+                info.get('calls_len', 0),
+                parent_width,
+            )
+            print(offset_pixels, slider_width, "final calculated geometry for branch session", session_id)
+            slider_spacer = info.get('slider_spacer')
+            if slider_spacer is not None:
+                slider_spacer.setFixedWidth(offset_pixels)
+
+            range_spacer = info.get('range_spacer')
+            if range_spacer is not None:
+                range_spacer.setFixedWidth(offset_pixels)
+
+            slider = info.get('slider')
+            if slider is not None:
+                slider.setFixedWidth(slider_width)
+
+            range_widget = info.get('range_widget')
+            if range_widget is not None:
+                range_widget.setFixedWidth(slider_width)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._update_branch_slider_geometry)
     
     def _on_range_changed(self, session_id: int, handle: str, value: int):
         """Handle range selector change"""
