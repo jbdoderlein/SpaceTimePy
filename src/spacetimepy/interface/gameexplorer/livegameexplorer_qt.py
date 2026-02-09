@@ -244,6 +244,12 @@ class GameExplorerQt(QMainWindow):
         self.comparison_session_id = None
         self.comparison_checkboxes = {}
         
+        # Constants for display formatting
+        self.COMPARISON_BLEND_ALPHA = 0.3  # Alpha for image comparison blending
+        self.MAX_COLLECTION_EXPANSION_SIZE = 20  # Max items in list/dict to expand
+        self.MAX_KEY_LENGTH = 50  # Max length for dict keys
+        self.MAX_STRING_DISPLAY_LENGTH = 100  # Max string length before truncation
+        
         # Range selection per session
         self.range_start = {}
         self.range_end = {}
@@ -964,8 +970,8 @@ class GameExplorerQt(QMainWindow):
                 if pil_image.size != comparison_image.size:
                     comparison_image = comparison_image.resize(pil_image.size, Image.Resampling.LANCZOS)
                 
-                # Blend images with 0.3 alpha for subtle overlay
-                pil_image = Image.blend(pil_image, comparison_image, 0.3)
+                # Blend images with comparison blend alpha for subtle overlay
+                pil_image = Image.blend(pil_image, comparison_image, self.COMPARISON_BLEND_ALPHA)
             
             # Convert to QPixmap
             img_byte_arr = io.BytesIO()
@@ -1037,7 +1043,7 @@ class GameExplorerQt(QMainWindow):
 
         # Apply color if values are different
         if values_different:
-            # Set green color for different values
+            # Set green color for different values (green indicates change/difference from comparison)
             item.setForeground(1, QColor('green'))
 
         # Add sub-fields if the value has interesting attributes
@@ -1048,15 +1054,15 @@ class GameExplorerQt(QMainWindow):
                     if comparison_value is not None and hasattr(comparison_value, '__dict__'):
                         comp_attr_value = getattr(comparison_value, attr_name, None)
                     self._add_variable_to_tree(item, attr_name, attr_value, comp_attr_value)
-        elif isinstance(value, dict) and len(value) < 20:  # Limit dict expansion
+        elif isinstance(value, dict) and len(value) < self.MAX_COLLECTION_EXPANSION_SIZE:
             for key, val in value.items():
                 key_str = str(key)
-                if len(key_str) < 50:  # Limit key length
+                if len(key_str) < self.MAX_KEY_LENGTH:
                     comp_val = None
                     if isinstance(comparison_value, dict):
                         comp_val = comparison_value.get(key, None)
                     self._add_variable_to_tree(item, f'[{key_str}]', val, comp_val)
-        elif isinstance(value, (list, tuple)) and len(value) < 20:  # Limit list expansion
+        elif isinstance(value, (list, tuple)) and len(value) < self.MAX_COLLECTION_EXPANSION_SIZE:
             for i, val in enumerate(value):
                 comp_val = None
                 if isinstance(comparison_value, (list, tuple)) and i < len(comparison_value):
@@ -1069,8 +1075,8 @@ class GameExplorerQt(QMainWindow):
             if value is None:
                 return 'None'
             if isinstance(value, str):
-                if len(value) > 100:
-                    return f'"{value[:100]}..."'
+                if len(value) > self.MAX_STRING_DISPLAY_LENGTH:
+                    return f'"{value[:self.MAX_STRING_DISPLAY_LENGTH]}..."'
                 return f'"{value}"'
             if isinstance(value, (int, float, bool)):
                 return str(value)
