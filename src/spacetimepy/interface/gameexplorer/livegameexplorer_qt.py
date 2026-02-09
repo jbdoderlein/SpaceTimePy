@@ -19,10 +19,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QVBoxLayout,
     QHBoxLayout, QSplitter, QTreeWidget, QTreeWidgetItem, QFrame,
     QScrollArea, QCheckBox, QPushButton, QSpinBox, QGroupBox, QTextEdit,
-    QMessageBox
+    QMessageBox, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF, QEvent
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont, QTextCursor, QTextFormat
 
 from PIL import Image
 
@@ -209,6 +209,9 @@ class GameExplorerQt(QMainWindow):
         self.current_highlighted_line = None
         self.file_modified = False
         self.save_button = None
+
+        # Image scaling
+        self.current_pixmap = None
         
         # Checkbox variables
         self.global_vars = {}
@@ -345,6 +348,7 @@ class GameExplorerQt(QMainWindow):
         self.image_label = QLabel("Loading...")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(400, 300)
+        self.image_label.installEventFilter(self)
         image_layout.addWidget(self.image_label)
         top_splitter.addWidget(image_frame)
         
@@ -375,7 +379,7 @@ class GameExplorerQt(QMainWindow):
         
         tracked_scroll = QScrollArea()
         tracked_scroll.setWidgetResizable(True)
-        tracked_scroll.setMaximumHeight(100)
+        tracked_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tracked_content = QWidget()
         self.tracked_content_layout = QVBoxLayout(self.tracked_content)
         tracked_scroll.setWidget(self.tracked_content)
@@ -385,6 +389,7 @@ class GameExplorerQt(QMainWindow):
         
         # Code Editor frame
         code_editor_frame = QGroupBox("Code Editor")
+        self.code_editor_frame = code_editor_frame
         code_editor_layout = QVBoxLayout(code_editor_frame)
         
         # Save button
@@ -437,6 +442,9 @@ class GameExplorerQt(QMainWindow):
         
         # Create session sliders
         self._create_session_sliders()
+
+        # Populate tracked functions
+        self._setup_tracked_functions()
         
         # Update display
         self._update_display()
@@ -477,6 +485,9 @@ class GameExplorerQt(QMainWindow):
                 lambda handle, val, sid=session_id: self._on_range_changed(sid, handle, val)
             )
             session_layout.addWidget(range_widget)
+
+            range_label = QLabel(f"Range: 1 - {len(calls)}")
+            session_layout.addWidget(range_label)
             
             # Control buttons
             controls = QWidget()
@@ -505,6 +516,7 @@ class GameExplorerQt(QMainWindow):
             self.session_sliders[session_id] = {
                 'slider': slider,
                 'range_widget': range_widget,
+                'range_label': range_label,
                 'frame': session_frame
             }
             
@@ -524,6 +536,19 @@ class GameExplorerQt(QMainWindow):
             self.range_start[session_id] = value
         else:
             self.range_end[session_id] = value
+
+        self._update_range_label(session_id)
+
+    def _update_range_label(self, session_id: int):
+        slider_info = self.session_sliders.get(session_id)
+        if not slider_info:
+            return
+
+        start_idx = self.range_start.get(session_id, 0)
+        end_idx = self.range_end.get(session_id, 0)
+        label = slider_info.get('range_label')
+        if label:
+            label.setText(f"Range: {start_idx + 1} - {end_idx + 1}")
     
     def _update_display(self):
         """Update all display elements"""
@@ -548,12 +573,15 @@ class GameExplorerQt(QMainWindow):
         # Update info label
         info_text = f"Session: {self.current_session_id} | Call: {self.current_call_index + 1}/{len(calls)}\n"
         info_text += f"Function: {current_call.function}\n"
-        if current_call.source_file:
-            info_text += f"File: {current_call.source_file}:{current_call.source_line}"
+        if current_call.file:
+            info_text += f"File: {current_call.file}:{current_call.line}"
         self.info_label.setText(info_text)
         
         # Update variables tree
         self._update_variables_display(call_data)
+
+        # Update code editor
+        self._update_code_editor(current_call)
         
         # Update status
         self.status_label.setText(f"Viewing call {self.current_call_index + 1} of {len(calls)}")
@@ -561,12 +589,44 @@ class GameExplorerQt(QMainWindow):
     def _get_call_data(self, call: FunctionCall) -> dict:
         """Get call data including variables and metadata"""
         try:
-            return {
-                'locals': call.locals_data or {},
-                'globals': call.globals_data or {},
-                'metadata': call.metadata or {},
-                'return_value': call.return_value
+            data = {
+                'locals': {},
+                'globals': {},
+                'metadata': call.call_metadata or {},
+                'return_value': None
             }
+
+            # Load locals
+            if call.locals_refs and self.object_manager:
+                for var_name, ref in call.locals_refs.items():
+                    if ref == "<unserializable>":
+                        continue
+                    try:
+                        data['locals'][var_name] = self.object_manager.rehydrate(ref)
+                    except Exception as e:
+                        print(f"Error loading local variable {var_name}: {e}")
+                        data['locals'][var_name] = f"Error loading: {e}"
+
+            # Load globals
+            if call.globals_refs and self.object_manager:
+                for var_name, ref in call.globals_refs.items():
+                    if ref == "<unserializable>":
+                        continue
+                    if not var_name.startswith('__'):
+                        try:
+                            data['globals'][var_name] = self.object_manager.rehydrate(ref)
+                        except Exception as e:
+                            print(f"Error loading global variable {var_name}: {e}")
+                            data['globals'][var_name] = f"Error loading: {e}"
+
+            if call.return_ref and self.object_manager:
+                try:
+                    data['return_value'] = self.object_manager.rehydrate(call.return_ref)
+                except Exception as e:
+                    print(f"Error loading return value: {e}")
+                    data['return_value'] = f"Error loading: {e}"
+
+            return data
         except Exception as e:
             print(f"Error getting call data: {e}")
             return {}
@@ -584,11 +644,6 @@ class GameExplorerQt(QMainWindow):
     def _display_image(self, pil_image: Image.Image):
         """Display PIL image in the label"""
         try:
-            # Scale image
-            width = int(pil_image.width * self.image_scale)
-            height = int(pil_image.height * self.image_scale)
-            pil_image = pil_image.resize((width, height), Image.Resampling.LANCZOS)
-            
             # Convert to QPixmap
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='PNG')
@@ -596,14 +651,14 @@ class GameExplorerQt(QMainWindow):
             
             qimage = QImage()
             qimage.loadFromData(img_byte_arr)
-            pixmap = QPixmap.fromImage(qimage)
-            
-            self.image_label.setPixmap(pixmap)
+            self.current_pixmap = QPixmap.fromImage(qimage)
+            self._fit_image_to_label()
         except Exception as e:
             print(f"Error displaying image: {e}")
     
     def _update_variables_display(self, call_data: dict):
         """Update the variables tree widget"""
+        self._snapshot_tree_expanded()
         self.variables_tree.clear()
         
         if not call_data:
@@ -622,6 +677,198 @@ class GameExplorerQt(QMainWindow):
             for key, value in call_data['globals'].items():
                 if not key.startswith('__'):
                     item = QTreeWidgetItem(globals_root, [str(key), str(value), ''])
+
+        self._restore_tree_expanded()
+
+    def _snapshot_tree_expanded(self):
+        if not self.variables_tree:
+            return
+
+        expanded = set()
+
+        def walk(item, path_parts):
+            path = path_parts + [item.text(0)]
+            if item.isExpanded():
+                expanded.add(" > ".join(path))
+            for i in range(item.childCount()):
+                walk(item.child(i), path)
+
+        for i in range(self.variables_tree.topLevelItemCount()):
+            walk(self.variables_tree.topLevelItem(i), [])
+
+        self.expanded_items = expanded
+
+    def _restore_tree_expanded(self):
+        if not self.variables_tree or not self.expanded_items:
+            return
+
+        def walk(item, path_parts):
+            path = path_parts + [item.text(0)]
+            if " > ".join(path) in self.expanded_items:
+                item.setExpanded(True)
+            for i in range(item.childCount()):
+                walk(item.child(i), path)
+
+        for i in range(self.variables_tree.topLevelItemCount()):
+            walk(self.variables_tree.topLevelItem(i), [])
+
+    def _clear_layout(self, layout: QVBoxLayout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _setup_tracked_functions(self):
+        """Populate tracked functions checkboxes from child calls"""
+        if not self.sessions_data or self.session is None or not self.tracked_content:
+            return
+
+        self._clear_layout(self.tracked_content_layout)
+        self.tracked_vars.clear()
+
+        all_tracked_functions = set()
+        for session_data in self.sessions_data.values():
+            for call in session_data['calls']:
+                child_calls = call.get_child_calls(self.session)
+                for child_call in child_calls:
+                    if child_call.function != self.tracked_function and child_call.function != "mock_func":
+                        all_tracked_functions.add(child_call.function)
+
+        for func_name in sorted(all_tracked_functions):
+            cb = QCheckBox(func_name)
+            cb.setChecked(True)
+            self.tracked_vars[func_name] = cb
+            self.tracked_content_layout.addWidget(cb)
+
+        self.tracked_content_layout.addStretch()
+
+    def _update_code_editor(self, call: FunctionCall):
+        """Update the code editor with source code from the current function call"""
+        if not self.code_editor:
+            return
+
+        file_path = call.file
+        line_number = call.line
+
+        if not file_path and call.code_definition_id and self.session:
+            try:
+                from spacetimepy.core.models import CodeDefinition
+                code_def = self.session.query(CodeDefinition).filter(
+                    CodeDefinition.id == call.code_definition_id
+                ).first()
+
+                if code_def:
+                    module_path = code_def.module_path
+                    if module_path and not module_path.endswith('.py'):
+                        possible_paths = [
+                            module_path + '.py',
+                            module_path.replace('.', '/') + '.py',
+                            module_path.replace('.', os.sep) + '.py'
+                        ]
+                        for path in possible_paths:
+                            if os.path.exists(path):
+                                file_path = path
+                                break
+                    else:
+                        file_path = module_path
+
+                    if code_def.first_line_no:
+                        line_number = code_def.first_line_no
+            except Exception as e:
+                print(f"Error getting code definition: {e}")
+
+        if file_path and file_path != self.current_source_file:
+            self._load_source_code(file_path, line_number)
+        elif file_path and line_number and line_number != self.current_highlighted_line:
+            self._highlight_line(line_number)
+        elif not file_path:
+            self.code_editor.setPlainText("No source code available for this function call")
+            self.current_source_file = None
+            self.current_highlighted_line = None
+            self._update_code_editor_title()
+
+    def _load_source_code(self, file_path: str, highlight_line: int | None = None):
+        """Load source code from file into the code editor and optionally highlight a line"""
+        if not self.code_editor:
+            return
+
+        try:
+            if file_path and os.path.exists(file_path):
+                with open(file_path, encoding='utf-8') as f:
+                    content = f.read()
+                self.code_editor.setPlainText(content)
+                if highlight_line is not None:
+                    self._highlight_line(highlight_line)
+                self.current_source_file = file_path
+            else:
+                self.code_editor.setPlainText(f"Source file not found: {file_path or 'Unknown'}")
+                self.current_source_file = None
+            self.current_highlighted_line = None
+            self.file_modified = False
+            self._update_code_editor_title()
+        except Exception as e:
+            print(f"Error loading source code from {file_path}: {e}")
+            self.code_editor.setPlainText(f"Error loading source code: {e}")
+            self.current_source_file = None
+            self.current_highlighted_line = None
+            self.file_modified = False
+            self._update_code_editor_title()
+
+    def _highlight_line(self, line_number: int):
+        """Highlight a specific line in the code editor"""
+        if not self.code_editor:
+            return
+
+        try:
+            cursor = self.code_editor.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            for _ in range(max(0, line_number - 1)):
+                cursor.movePosition(QTextCursor.Down)
+            cursor.select(QTextCursor.LineUnderCursor)
+
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = cursor
+            selection.format.setBackground(QColor('#ffff88'))
+            selection.format.setProperty(QTextFormat.FullWidthSelection, True)
+
+            self.code_editor.setExtraSelections([selection])
+            self.code_editor.setTextCursor(cursor)
+            self.code_editor.ensureCursorVisible()
+            self.current_highlighted_line = line_number
+        except Exception as e:
+            print(f"Error highlighting line {line_number}: {e}")
+
+    def _update_code_editor_title(self):
+        """Update the code editor frame title"""
+        if not self.code_editor_frame:
+            return
+
+        if self.current_source_file:
+            filename = os.path.basename(self.current_source_file)
+            title = f"Code Editor - {filename}"
+        else:
+            title = "Code Editor"
+        self.code_editor_frame.setTitle(title)
+
+    def eventFilter(self, obj, event):
+        if obj == self.image_label and event.type() == QEvent.Resize:
+            self._fit_image_to_label()
+        return super().eventFilter(obj, event)
+
+    def _fit_image_to_label(self):
+        if not self.current_pixmap or not self.image_label:
+            return
+
+        target_w = max(1, int(self.image_label.width() * self.image_scale))
+        target_h = max(1, int(self.image_label.height() * self.image_scale))
+        scaled = self.current_pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled)
     
     def _replay_all(self, session_id: int):
         """Replay entire session"""
@@ -629,12 +876,25 @@ class GameExplorerQt(QMainWindow):
             session_data = self.sessions_data.get(session_id)
             if not session_data:
                 return
+
+            calls = session_data['calls']
+            if not calls:
+                return
+
+            first_call_id = calls[0].id
+            mocked_functions = self._get_mocked_functions()
             
             self.status_label.setText(f"Replaying session {session_id}...")
             QApplication.processEvents()
+
+            init_monitoring(db_path=self.db_path, custom_picklers=["pygame"])
+            new_session_id = start_session(f"Replay of session {session_id}")
+            if not new_session_id:
+                self.status_label.setText("Failed to start session")
+                return
             
             # Replay using core functionality
-            replay_session_sequence(session_id, self.db_path)
+            replay_session_sequence(first_call_id, self.db_path, mock_functions=mocked_functions)
             
             self.status_label.setText(f"Replay of session {session_id} complete")
         except Exception as e:
@@ -642,6 +902,9 @@ class GameExplorerQt(QMainWindow):
             print(f"Error replaying session: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            with contextlib.suppress(Exception):
+                end_session()
     
     def _replay_from_here(self, session_id: int):
         """Replay from current position"""
@@ -665,9 +928,16 @@ class GameExplorerQt(QMainWindow):
             
             # Get start call ID
             start_call_id = calls[start_index].id
+            mocked_functions = self._get_mocked_functions()
             
             # Replay subsequence
-            replay_session_subsequence(session_id, start_call_id, None, self.db_path)
+            init_monitoring(db_path=self.db_path, custom_picklers=["pygame"])
+            new_session_id = start_session(f"Replay from session {session_id} call {start_index + 1}")
+            if not new_session_id:
+                self.status_label.setText("Failed to start session")
+                return
+
+            replay_session_sequence(start_call_id, self.db_path, mock_functions=mocked_functions)
             
             self.status_label.setText(f"Replay complete")
         except Exception as e:
@@ -675,6 +945,9 @@ class GameExplorerQt(QMainWindow):
             print(f"Error replaying from here: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            with contextlib.suppress(Exception):
+                end_session()
     
     def _replay_subsequence(self, session_id: int):
         """Replay selected subsequence"""
@@ -689,14 +962,32 @@ class GameExplorerQt(QMainWindow):
             calls = session_data['calls']
             if start_idx >= len(calls) or end_idx >= len(calls):
                 return
+
+            if start_idx > end_idx:
+                start_idx, end_idx = end_idx, start_idx
             
             self.status_label.setText(f"Replaying calls {start_idx} to {end_idx}...")
             QApplication.processEvents()
             
             start_call_id = calls[start_idx].id
             end_call_id = calls[end_idx].id
+
+            mocked_functions = self._get_mocked_functions()
+
+            init_monitoring(db_path=self.db_path, custom_picklers=["pygame"])
+            new_session_id = start_session(
+                f"Replay subsequence session {session_id} calls {start_idx + 1}-{end_idx + 1}"
+            )
+            if not new_session_id:
+                self.status_label.setText("Failed to start session")
+                return
             
-            replay_session_subsequence(session_id, start_call_id, end_call_id, self.db_path)
+            replay_session_subsequence(
+                start_call_id,
+                end_call_id,
+                self.db_path,
+                mock_functions=mocked_functions,
+            )
             
             self.status_label.setText(f"Replay complete")
         except Exception as e:
@@ -704,6 +995,13 @@ class GameExplorerQt(QMainWindow):
             print(f"Error replaying subsequence: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            with contextlib.suppress(Exception):
+                end_session()
+
+    def _get_mocked_functions(self) -> list[str]:
+        """Get list of functions that should be mocked (checked)"""
+        return [name for name, cb in self.tracked_vars.items() if cb.isChecked()]
     
     def _save_current_file(self):
         """Save current file (placeholder)"""
