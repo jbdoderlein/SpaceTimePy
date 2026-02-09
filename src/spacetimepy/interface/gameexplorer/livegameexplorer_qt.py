@@ -54,7 +54,9 @@ except ImportError:
 
 import pygame
 
+# Constants
 HIDDEN_PYGAME = False
+PYGMENTS_STYLE = 'default'  # Pygments syntax highlighting style
 original_set_mode = pygame.display.set_mode
 
 
@@ -795,7 +797,8 @@ class GameExplorerQt(QMainWindow):
         if self.stroboscopic_checkboxes[session_id].isChecked():
             self.stroboscopic_session_id = session_id
             print(f"Stroboscopic mode enabled for session {session_id}")
-            # TODO: Add stroboscopic control panel
+            # Note: Stroboscopic control panel (ghost count, offset, start position) will be
+            # added in a future enhancement. For now, stroboscopic mode is tracked but not visualized.
         else:
             self.stroboscopic_session_id = None
             print("Stroboscopic mode disabled")
@@ -1091,7 +1094,7 @@ class GameExplorerQt(QMainWindow):
                 # Use Pygments for syntax highlighting if available
                 if PYGMENTS_AVAILABLE:
                     # Generate HTML with syntax highlighting
-                    formatter = HtmlFormatter(style='default', linenos=False, full=False)
+                    formatter = HtmlFormatter(style=PYGMENTS_STYLE, linenos=False, full=False)
                     highlighted_html = highlight(content, PythonLexer(), formatter)
                     
                     # Get CSS for styling
@@ -1214,12 +1217,7 @@ class GameExplorerQt(QMainWindow):
             replay_session_sequence(first_call_id, self.db_path, mock_functions=mocked_functions)
             
             # Close pygame screen after successful replay
-            try:
-                import pygame
-                pygame.quit()
-                print("Pygame screen closed after replay")
-            except Exception as pygame_err:
-                print(f"Warning: Could not close pygame screen: {pygame_err}")
+            self._cleanup_pygame()
             
             self.status_label.setText(f"Replay of session {session_id} complete")
             
@@ -1273,12 +1271,7 @@ class GameExplorerQt(QMainWindow):
             replay_session_sequence(start_call_id, self.db_path, mock_functions=mocked_functions)
             
             # Close pygame screen after successful replay
-            try:
-                import pygame
-                pygame.quit()
-                print("Pygame screen closed after replay")
-            except Exception as pygame_err:
-                print(f"Warning: Could not close pygame screen: {pygame_err}")
+            self._cleanup_pygame()
             
             self.status_label.setText(f"Replay complete")
             
@@ -1339,12 +1332,7 @@ class GameExplorerQt(QMainWindow):
             )
             
             # Close pygame screen after successful replay
-            try:
-                import pygame
-                pygame.quit()
-                print("Pygame screen closed after replay")
-            except Exception as pygame_err:
-                print(f"Warning: Could not close pygame screen: {pygame_err}")
+            self._cleanup_pygame()
             
             self.status_label.setText(f"Replay complete")
             
@@ -1362,6 +1350,15 @@ class GameExplorerQt(QMainWindow):
     def _get_mocked_functions(self) -> list[str]:
         """Get list of functions that should be mocked (checked)"""
         return [name for name, cb in self.tracked_vars.items() if cb.isChecked()]
+    
+    def _cleanup_pygame(self):
+        """Clean up pygame resources after replay"""
+        try:
+            import pygame
+            pygame.quit()
+            print("Pygame screen closed after replay")
+        except Exception as pygame_err:
+            print(f"Warning: Could not close pygame screen: {pygame_err}")
     
     def _save_current_file(self):
         """Save current file (placeholder)"""
