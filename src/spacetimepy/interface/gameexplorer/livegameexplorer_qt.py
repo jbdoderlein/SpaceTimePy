@@ -172,9 +172,6 @@ class TwoHandleRangeQt(QWidget):
         painter.drawEllipse(QPointF(sx, y), r, r)
         painter.drawEllipse(QPointF(ex, y), r, r)
 
-
-    
-
 class GameExplorerQt(QMainWindow):
     """Qt-based Game Explorer for replaying pygame executions"""
     
@@ -550,7 +547,7 @@ class GameExplorerQt(QMainWindow):
         
         # Update info label
         info_text = f"Session: {self.current_session_id} | Call: {self.current_call_index + 1}/{len(calls)}\n"
-        info_text += f"Function: {current_call.function_name}\n"
+        info_text += f"Function: {current_call.function}\n"
         if current_call.source_file:
             info_text += f"File: {current_call.source_file}:{current_call.source_line}"
         self.info_label.setText(info_text)
