@@ -21,13 +21,23 @@ from PyQt5.QtWidgets import (
     QScrollArea, QCheckBox, QPushButton, QSpinBox, QGroupBox, QTextEdit,
     QMessageBox, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF, QEvent, QRegExp
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF, QEvent
 from PyQt5.QtGui import (
     QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont, QTextCursor, 
-    QTextFormat, QSyntaxHighlighter, QTextCharFormat
+    QTextFormat
 )
 
 from PIL import Image
+
+# Import Pygments for syntax highlighting
+try:
+    from pygments import highlight
+    from pygments.lexers import PythonLexer
+    from pygments.formatters import HtmlFormatter
+    PYGMENTS_AVAILABLE = True
+except ImportError:
+    PYGMENTS_AVAILABLE = False
+    print("Warning: pygments not available. Syntax highlighting will be disabled.")
 
 from spacetimepy.core import FunctionCall, MonitoringSession, ObjectManager, init_db, FunctionCallRepository
 from spacetimepy.core.monitoring import init_monitoring
@@ -174,105 +184,6 @@ class TwoHandleRangeQt(QWidget):
         painter.setBrush(QBrush(QColor('#ffffff')))
         painter.drawEllipse(QPointF(sx, y), r, r)
         painter.drawEllipse(QPointF(ex, y), r, r)
-
-
-class PythonSyntaxHighlighter(QSyntaxHighlighter):
-    """Simple Python syntax highlighter for the code editor"""
-    
-    def __init__(self, document):
-        super().__init__(document)
-        
-        # Define formatting for different token types
-        self.highlighting_rules = []
-        
-        # Keywords
-        keyword_format = QTextCharFormat()
-        keyword_format.setForeground(QColor('#0000FF'))
-        keyword_format.setFontWeight(QFont.Bold)
-        keywords = [
-            'and', 'as', 'assert', 'break', 'class', 'continue', 'def',
-            'del', 'elif', 'else', 'except', 'False', 'finally', 'for',
-            'from', 'global', 'if', 'import', 'in', 'is', 'lambda',
-            'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return',
-            'True', 'try', 'while', 'with', 'yield', 'async', 'await'
-        ]
-        for keyword in keywords:
-            pattern = QRegExp(rf'\b{keyword}\b')
-            self.highlighting_rules.append((pattern, keyword_format))
-        
-        # Built-in functions
-        builtin_format = QTextCharFormat()
-        builtin_format.setForeground(QColor('#795E26'))
-        builtins = [
-            'abs', 'all', 'any', 'bin', 'bool', 'bytes', 'chr', 'dict',
-            'dir', 'enumerate', 'filter', 'float', 'format', 'frozenset',
-            'int', 'isinstance', 'len', 'list', 'map', 'max', 'min',
-            'open', 'print', 'range', 'set', 'str', 'sum', 'tuple', 'type', 'zip'
-        ]
-        for builtin in builtins:
-            pattern = QRegExp(rf'\b{builtin}\b')
-            self.highlighting_rules.append((pattern, builtin_format))
-        
-        # Strings (double-quoted)
-        string_format = QTextCharFormat()
-        string_format.setForeground(QColor('#A31515'))
-        self.highlighting_rules.append((QRegExp(r'"[^"\\]*(\\.[^"\\]*)*"'), string_format))
-        
-        # Strings (single-quoted)
-        self.highlighting_rules.append((QRegExp(r"'[^'\\]*(\\.[^'\\]*)*'"), string_format))
-        
-        # Comments
-        comment_format = QTextCharFormat()
-        comment_format.setForeground(QColor('#008000'))
-        comment_format.setFontItalic(True)
-        self.highlighting_rules.append((QRegExp(r'#[^\n]*'), comment_format))
-        
-        # Numbers
-        number_format = QTextCharFormat()
-        number_format.setForeground(QColor('#098658'))
-        self.highlighting_rules.append((QRegExp(r'\b[0-9]+\b'), number_format))
-        
-        # Store special patterns for function and class names
-        self.function_pattern = QRegExp(r'\bdef\s+([A-Za-z_][A-Za-z0-9_]*)')
-        self.function_format = QTextCharFormat()
-        self.function_format.setForeground(QColor('#795E26'))
-        self.function_format.setFontWeight(QFont.Bold)
-        
-        self.class_pattern = QRegExp(r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)')
-        self.class_format = QTextCharFormat()
-        self.class_format.setForeground(QColor('#267F99'))
-        self.class_format.setFontWeight(QFont.Bold)
-    
-    def highlightBlock(self, text):
-        """Apply syntax highlighting to the given text block"""
-        # Apply general rules first
-        for pattern, format_style in self.highlighting_rules:
-            expression = QRegExp(pattern)
-            index = expression.indexIn(text)
-            while index >= 0:
-                length = expression.matchedLength()
-                self.setFormat(index, length, format_style)
-                index = expression.indexIn(text, index + length)
-        
-        # Handle function definitions specially - only highlight the name
-        index = self.function_pattern.indexIn(text)
-        while index >= 0:
-            # Cap(1) contains the function name (first captured group)
-            length = len(self.function_pattern.cap(1))
-            # Calculate position: def + whitespace + name
-            name_start = index + text[index:].index(self.function_pattern.cap(1))
-            self.setFormat(name_start, length, self.function_format)
-            index = self.function_pattern.indexIn(text, index + 1)
-        
-        # Handle class definitions specially - only highlight the name
-        index = self.class_pattern.indexIn(text)
-        while index >= 0:
-            # Cap(1) contains the class name (first captured group)
-            length = len(self.class_pattern.cap(1))
-            # Calculate position: class + whitespace + name
-            name_start = index + text[index:].index(self.class_pattern.cap(1))
-            self.setFormat(name_start, length, self.class_format)
-            index = self.class_pattern.indexIn(text, index + 1)
 
 
 class GameExplorerQt(QMainWindow):
@@ -426,6 +337,38 @@ class GameExplorerQt(QMainWindow):
                                 self.session_relationships[other_sid]['child_sessions'].append(session_id)
                                 break
     
+    def _get_sorted_sessions_for_display(self) -> list[int]:
+        """Sort sessions to display parent sessions before child sessions"""
+        sorted_sessions = []
+        processed = set()
+
+        # First add all main sessions (no parent)
+        for session_id, rel in self.session_relationships.items():
+            if not rel.get('parent_session_id'):
+                sorted_sessions.append(session_id)
+                processed.add(session_id)
+
+        # Then add child sessions in order
+        while len(processed) < len(self.sessions_data):
+            added_in_iteration = False
+            for session_id, rel in self.session_relationships.items():
+                if session_id not in processed:
+                    parent_id = rel.get('parent_session_id')
+                    if parent_id is None or parent_id in processed:
+                        sorted_sessions.append(session_id)
+                        processed.add(session_id)
+                        added_in_iteration = True
+
+            if not added_in_iteration:
+                # Add any remaining sessions to avoid infinite loop
+                for session_id in self.sessions_data:
+                    if session_id not in processed:
+                        sorted_sessions.append(session_id)
+                        processed.add(session_id)
+                break
+
+        return sorted_sessions
+    
     def _create_ui(self):
         """Create the main user interface"""
         self.setWindowTitle(self.window_title)
@@ -508,13 +451,15 @@ class GameExplorerQt(QMainWindow):
         
         code_editor_layout.addWidget(editor_controls)
         
-        # Code editor with syntax highlighting
+        # Code editor with Pygments syntax highlighting
         self.code_editor = QTextEdit()
         self.code_editor.setReadOnly(True)
-        self.code_editor.setFont(QFont("Courier", 10))
         
-        # Apply syntax highlighter
-        self.syntax_highlighter = PythonSyntaxHighlighter(self.code_editor.document())
+        # Use HTML rendering for syntax highlighting if Pygments is available
+        if PYGMENTS_AVAILABLE:
+            self.code_editor.setAcceptRichText(True)
+        else:
+            self.code_editor.setFont(QFont("Courier", 10))
         
         code_editor_layout.addWidget(self.code_editor)
         
@@ -588,17 +533,74 @@ class GameExplorerQt(QMainWindow):
         self._update_display()
     
     def _create_session_sliders(self):
-        """Create slider controls for each session"""
-        for session_id in sorted(self.sessions_data.keys()):
+        """Create slider controls for each session with branching visualization"""
+        # Sort sessions to show parent sessions before child sessions
+        sorted_sessions = self._get_sorted_sessions_for_display()
+        
+        for session_id in sorted_sessions:
             session_data = self.sessions_data[session_id]
             calls = session_data['calls']
             
             if not calls:
                 continue
             
-            # Create session frame
-            session_frame = QGroupBox(f"Session {session_id} ({len(calls)} calls)")
+            # Get relationship info
+            rel = self.session_relationships.get(session_id, {})
+            is_branch = rel.get('parent_session_id') is not None
+            branch_point_index = rel.get('branch_point_index')
+            
+            # Create frame with indent for branches
+            session_name = session_data.get('name', f"Session {session_id}")
+            session_frame = QGroupBox(f"{session_name} ({len(calls)} calls)")
             session_layout = QVBoxLayout(session_frame)
+            
+            # Add margin for branches
+            if is_branch:
+                session_frame.setStyleSheet("QGroupBox { margin-left: 20px; }")
+            
+            # Session info with branch information
+            info_text = ""
+            if 'session' in session_data:
+                session_info = session_data['session']
+                info_text = f"Started: {session_info.start_time.strftime('%H:%M:%S')}"
+                if session_info.description:
+                    info_text += f" - {session_info.description}"
+            
+            if is_branch:
+                parent_id = rel['parent_session_id']
+                parent_name = self.sessions_data[parent_id].get('name', f"Session {parent_id}") if parent_id in self.sessions_data else f"Session {parent_id}"
+                info_text += f" | Branches from {parent_name}"
+                if branch_point_index is not None:
+                    info_text += f" at frame {branch_point_index + 1}"
+            
+            if info_text:
+                info_label = QLabel(info_text)
+                info_label.setWordWrap(True)
+                session_layout.addWidget(info_label)
+            
+            # Checkbox frame for Compare and Stroboscopic
+            checkbox_frame = QWidget()
+            checkbox_layout = QHBoxLayout(checkbox_frame)
+            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Compare checkbox
+            if session_id not in self.comparison_checkboxes:
+                self.comparison_checkboxes[session_id] = QCheckBox("Compare")
+                self.comparison_checkboxes[session_id].stateChanged.connect(
+                    lambda state, sid=session_id: self._on_comparison_selection_changed(sid)
+                )
+            checkbox_layout.addWidget(self.comparison_checkboxes[session_id])
+            
+            # Stroboscopic checkbox
+            if session_id not in self.stroboscopic_checkboxes:
+                self.stroboscopic_checkboxes[session_id] = QCheckBox("Stroboscopic")
+                self.stroboscopic_checkboxes[session_id].stateChanged.connect(
+                    lambda state, sid=session_id: self._on_stroboscopic_selection_changed(sid)
+                )
+            checkbox_layout.addWidget(self.stroboscopic_checkboxes[session_id])
+            
+            checkbox_layout.addStretch()
+            session_layout.addWidget(checkbox_frame)
             
             # Slider
             slider = QSlider(Qt.Horizontal)
@@ -759,6 +761,47 @@ class GameExplorerQt(QMainWindow):
         global HIDDEN_PYGAME
         HIDDEN_PYGAME = bool(state)
         print(f"Hidden pygame mode: {'ON' if HIDDEN_PYGAME else 'OFF'}")
+    
+    def _on_comparison_selection_changed(self, session_id: int):
+        """Handle comparison overlay selection change"""
+        # First, uncheck all other checkboxes (only one can be selected at a time)
+        for sid, checkbox in self.comparison_checkboxes.items():
+            if sid != session_id:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+
+        # Set the comparison session
+        if self.comparison_checkboxes[session_id].isChecked():
+            self.comparison_session_id = session_id
+            print(f"Comparison mode enabled for session {session_id}")
+        else:
+            self.comparison_session_id = None
+            print("Comparison mode disabled")
+
+        # Update display to show comparison if enabled
+        self._update_display()
+    
+    def _on_stroboscopic_selection_changed(self, session_id: int):
+        """Handle stroboscopic effect selection change"""
+        # First, uncheck all other checkboxes (only one can be selected at a time)
+        for sid, checkbox in self.stroboscopic_checkboxes.items():
+            if sid != session_id:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+
+        # Set the stroboscopic session
+        if self.stroboscopic_checkboxes[session_id].isChecked():
+            self.stroboscopic_session_id = session_id
+            print(f"Stroboscopic mode enabled for session {session_id}")
+            # TODO: Add stroboscopic control panel
+        else:
+            self.stroboscopic_session_id = None
+            print("Stroboscopic mode disabled")
+
+        # Update display
+        self._update_display()
     
     def _refresh_database(self):
         """Refresh database and reload sessions"""
@@ -1044,7 +1087,29 @@ class GameExplorerQt(QMainWindow):
             if file_path and os.path.exists(file_path):
                 with open(file_path, encoding='utf-8') as f:
                     content = f.read()
-                self.code_editor.setPlainText(content)
+                
+                # Use Pygments for syntax highlighting if available
+                if PYGMENTS_AVAILABLE:
+                    # Generate HTML with syntax highlighting
+                    formatter = HtmlFormatter(style='default', linenos=False, full=False)
+                    highlighted_html = highlight(content, PythonLexer(), formatter)
+                    
+                    # Get CSS for styling
+                    css = formatter.get_style_defs('.highlight')
+                    
+                    # Wrap in HTML with CSS
+                    html = f"""
+                    <style>
+                    {css}
+                    .highlight {{ font-family: Courier, monospace; font-size: 10pt; }}
+                    </style>
+                    <div class="highlight">{highlighted_html}</div>
+                    """
+                    
+                    self.code_editor.setHtml(html)
+                else:
+                    self.code_editor.setPlainText(content)
+                
                 if highlight_line is not None:
                     self._highlight_line(highlight_line)
                 self.current_source_file = file_path
@@ -1148,7 +1213,18 @@ class GameExplorerQt(QMainWindow):
             # Replay using core functionality
             replay_session_sequence(first_call_id, self.db_path, mock_functions=mocked_functions)
             
+            # Close pygame screen after successful replay
+            try:
+                import pygame
+                pygame.quit()
+                print("Pygame screen closed after replay")
+            except Exception as pygame_err:
+                print(f"Warning: Could not close pygame screen: {pygame_err}")
+            
             self.status_label.setText(f"Replay of session {session_id} complete")
+            
+            # Refresh the database to see new calls
+            self._refresh_database()
         except Exception as e:
             self.status_label.setText(f"Error replaying: {e}")
             print(f"Error replaying session: {e}")
@@ -1196,7 +1272,18 @@ class GameExplorerQt(QMainWindow):
 
             replay_session_sequence(start_call_id, self.db_path, mock_functions=mocked_functions)
             
+            # Close pygame screen after successful replay
+            try:
+                import pygame
+                pygame.quit()
+                print("Pygame screen closed after replay")
+            except Exception as pygame_err:
+                print(f"Warning: Could not close pygame screen: {pygame_err}")
+            
             self.status_label.setText(f"Replay complete")
+            
+            # Refresh the database
+            self._refresh_database()
         except Exception as e:
             self.status_label.setText(f"Error replaying: {e}")
             print(f"Error replaying from here: {e}")
@@ -1251,7 +1338,18 @@ class GameExplorerQt(QMainWindow):
                 mock_functions=mocked_functions,
             )
             
+            # Close pygame screen after successful replay
+            try:
+                import pygame
+                pygame.quit()
+                print("Pygame screen closed after replay")
+            except Exception as pygame_err:
+                print(f"Warning: Could not close pygame screen: {pygame_err}")
+            
             self.status_label.setText(f"Replay complete")
+            
+            # Refresh the database
+            self._refresh_database()
         except Exception as e:
             self.status_label.setText(f"Error replaying: {e}")
             print(f"Error replaying subsequence: {e}")
