@@ -173,9 +173,6 @@ class TwoHandleRangeQt(QWidget):
         painter.drawEllipse(QPointF(ex, y), r, r)
 
 
-class SessionData(TypedDict):
-    session_id: int
-    calls: list[Any]
     
 
 class GameExplorerQt(QMainWindow):
@@ -195,7 +192,7 @@ class GameExplorerQt(QMainWindow):
         
         self.session = None
         self.object_manager = None
-        self.sessions_data: dict[int, SessionData] = {}
+        self.sessions_data: dict[int, dict] = {}  # Dict[session_id, session_data]
         self.current_session_id = None
         self.current_call_index = 0
         
@@ -253,31 +250,41 @@ class GameExplorerQt(QMainWindow):
     
     def _init_database(self):
         """Initialize database connection and load sessions"""
+        if not os.path.exists(self.db_path):
+            print(f"Error: Database file not found at {self.db_path}")
+            sys.exit(1)
+        
         try:
-            init_db(self.db_path, reset=False, in_memory=self.in_memory_db)
-            self.session = MonitoringSession(ObjectManager())
+            # Initialize database session
+            Session = init_db(self.db_path)
+            self.session = Session()
+            self.object_manager = ObjectManager(self.session)
             
-            # Load all sessions
-            repo = FunctionCallRepository(self.session)
+            # Get all monitoring sessions
+            sessions = self.session.query(MonitoringSession).order_by(MonitoringSession.start_time).all()
             
-            # Get unique session IDs
-            all_calls = repo.get_all()
-            session_ids = sorted(set(call.session_id for call in all_calls))
+            if not sessions:
+                print("Error: No monitoring sessions found in database")
+                sys.exit(1)
             
-            # Load calls for each session
-            for session_id in session_ids:
-                calls = repo.get_by_session(session_id)
-                # Filter by tracked function
-                tracked_calls = [c for c in calls if c.function_name == self.tracked_function]
+            # Load tracked function calls for each session
+            for session in sessions:
+                tracked_calls = self.session.query(FunctionCall).filter(
+                    FunctionCall.session_id == session.id,
+                    FunctionCall.function == self.tracked_function
+                ).order_by(FunctionCall.order_in_session).all()
+                
                 if tracked_calls:
-                    self.sessions_data[session_id] = SessionData(
-                        session_id=session_id,
-                        calls=tracked_calls
-                    )
+                    self.sessions_data[session.id] = {
+                        'session': session,
+                        'calls': tracked_calls,
+                        'name': session.name or f"Session {session.id}",
+                        'start_time': session.start_time
+                    }
             
             if not self.sessions_data:
                 print(f"No tracked function calls found for '{self.tracked_function}'")
-                return
+                sys.exit(1)
             
             # Analyze relationships between sessions
             self._analyze_session_relationships()
