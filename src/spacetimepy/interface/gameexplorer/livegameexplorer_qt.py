@@ -244,16 +244,6 @@ class GameExplorerQt(QMainWindow):
         self.comparison_session_id = None
         self.comparison_checkboxes = {}
         
-        # Stroboscopic effect features
-        self.stroboscopic_session_id = None
-        self.stroboscopic_checkboxes = {}
-        self.stroboscopic_control_panels = {}
-        
-        # Stroboscopic settings
-        self.stroboscopic_ghost_count = {}
-        self.stroboscopic_offset = {}
-        self.stroboscopic_start_position = {}
-        
         # Range selection per session
         self.range_start = {}
         self.range_end = {}
@@ -404,8 +394,10 @@ class GameExplorerQt(QMainWindow):
         right_splitter = QSplitter(Qt.Vertical)
         top_splitter.addWidget(right_splitter)
         
-        # Variables tree frame
+        # Variables tree frame - collapsible
         info_frame = QGroupBox("Variables (Locals & Globals)")
+        info_frame.setCheckable(True)
+        info_frame.setChecked(True)
         info_layout = QVBoxLayout(info_frame)
         
         self.variables_tree = QTreeWidget()
@@ -421,8 +413,10 @@ class GameExplorerQt(QMainWindow):
         
         right_splitter.addWidget(info_frame)
         
-        # Tracked Functions frame
+        # Tracked Functions frame - collapsible
         tracked_frame = QGroupBox("Tracked Functions")
+        tracked_frame.setCheckable(True)
+        tracked_frame.setChecked(True)
         tracked_layout = QVBoxLayout(tracked_frame)
         
         tracked_scroll = QScrollArea()
@@ -453,15 +447,15 @@ class GameExplorerQt(QMainWindow):
         
         code_editor_layout.addWidget(editor_controls)
         
-        # Code editor with Pygments syntax highlighting
+        # Code editor - editable with plain text (not HTML)
         self.code_editor = QTextEdit()
-        self.code_editor.setReadOnly(True)
+        self.code_editor.setReadOnly(False)  # Make it editable
+        self.code_editor.setFont(QFont("Courier", 10))
+        self.code_editor.setAcceptRichText(False)  # Plain text only for editing
         
-        # Use HTML rendering for syntax highlighting if Pygments is available
-        if PYGMENTS_AVAILABLE:
-            self.code_editor.setAcceptRichText(True)
-        else:
-            self.code_editor.setFont(QFont("Courier", 10))
+        # Track modifications
+        self.code_editor.textChanged.connect(self._on_code_editor_changed)
+        self.file_modified = False
         
         code_editor_layout.addWidget(self.code_editor)
         
@@ -593,16 +587,11 @@ class GameExplorerQt(QMainWindow):
                 )
             checkbox_layout.addWidget(self.comparison_checkboxes[session_id])
             
-            # Stroboscopic checkbox
-            if session_id not in self.stroboscopic_checkboxes:
-                self.stroboscopic_checkboxes[session_id] = QCheckBox("Stroboscopic")
-                self.stroboscopic_checkboxes[session_id].stateChanged.connect(
-                    lambda state, sid=session_id: self._on_stroboscopic_selection_changed(sid)
-                )
-            checkbox_layout.addWidget(self.stroboscopic_checkboxes[session_id])
-            
             checkbox_layout.addStretch()
             session_layout.addWidget(checkbox_frame)
+            
+            # Set fixed maximum height for session frame to prevent expansion
+            session_frame.setMaximumHeight(200)
             
             # Slider
             slider = QSlider(Qt.Horizontal)
@@ -784,28 +773,6 @@ class GameExplorerQt(QMainWindow):
         # Update display to show comparison if enabled
         self._update_display()
     
-    def _on_stroboscopic_selection_changed(self, session_id: int):
-        """Handle stroboscopic effect selection change"""
-        # First, uncheck all other checkboxes (only one can be selected at a time)
-        for sid, checkbox in self.stroboscopic_checkboxes.items():
-            if sid != session_id:
-                checkbox.blockSignals(True)
-                checkbox.setChecked(False)
-                checkbox.blockSignals(False)
-
-        # Set the stroboscopic session
-        if self.stroboscopic_checkboxes[session_id].isChecked():
-            self.stroboscopic_session_id = session_id
-            print(f"Stroboscopic mode enabled for session {session_id}")
-            # Note: Stroboscopic control panel (ghost count, offset, start position) will be
-            # added in a future enhancement. For now, stroboscopic mode is tracked but not visualized.
-        else:
-            self.stroboscopic_session_id = None
-            print("Stroboscopic mode disabled")
-
-        # Update display
-        self._update_display()
-    
     def _refresh_database(self):
         """Refresh database and reload sessions"""
         try:
@@ -924,6 +891,38 @@ class GameExplorerQt(QMainWindow):
             print(f"Error getting call data: {e}")
             return {}
     
+    def _get_comparison_call_data(self, current_session_id: int, current_call_index: int) -> dict[str, Any] | None:
+        """Get call data from comparison session that corresponds to the current position"""
+        if not self.comparison_session_id or self.comparison_session_id not in self.sessions_data:
+            return None
+
+        # Check if comparison session is a child of current session
+        comparison_rel = self.session_relationships.get(self.comparison_session_id, {})
+        if comparison_rel.get('parent_session_id') == current_session_id:
+            # Comparison session branches from current session
+            branch_point_index = comparison_rel.get('branch_point_index')
+            if branch_point_index is not None and current_call_index >= branch_point_index:
+                # Current position is at or after the branch point
+                # Map to corresponding position in comparison session
+                offset_in_comparison = current_call_index - branch_point_index
+                comparison_calls = self.sessions_data[self.comparison_session_id]['calls']
+                if offset_in_comparison < len(comparison_calls):
+                    return self._get_call_data(comparison_calls[offset_in_comparison])
+
+        # Check if current session is a child of comparison session
+        current_rel = self.session_relationships.get(current_session_id, {})
+        if current_rel.get('parent_session_id') == self.comparison_session_id:
+            # Current session branches from comparison session
+            branch_point_index = current_rel.get('branch_point_index')
+            if branch_point_index is not None:
+                # Map current position back to comparison session
+                comparison_index = branch_point_index + current_call_index
+                comparison_calls = self.sessions_data[self.comparison_session_id]['calls']
+                if comparison_index < len(comparison_calls):
+                    return self._get_call_data(comparison_calls[comparison_index])
+
+        return None
+    
     def _decode_image(self, image_data: str) -> Image.Image:
         """Decode base64 image data"""
         try:
@@ -934,9 +933,24 @@ class GameExplorerQt(QMainWindow):
             print(f"Error decoding image: {e}")
         return None
     
-    def _display_image(self, pil_image: Image.Image):
-        """Display PIL image in the label"""
+    def _display_image(self, pil_image: Image.Image, comparison_image: Image.Image = None):
+        """Display PIL image in the label, optionally blended with comparison image"""
         try:
+            # If we have a comparison image, blend them
+            if comparison_image:
+                # Ensure both images are same mode
+                if pil_image.mode != 'RGB':
+                    pil_image = pil_image.convert('RGB')
+                if comparison_image.mode != 'RGB':
+                    comparison_image = comparison_image.convert('RGB')
+                
+                # Resize comparison image to match main image
+                if pil_image.size != comparison_image.size:
+                    comparison_image = comparison_image.resize(pil_image.size, Image.Resampling.LANCZOS)
+                
+                # Blend images with 0.3 alpha for subtle overlay
+                pil_image = Image.blend(pil_image, comparison_image, 0.3)
+            
             # Convert to QPixmap
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format='PNG')
@@ -949,7 +963,7 @@ class GameExplorerQt(QMainWindow):
         except Exception as e:
             print(f"Error displaying image: {e}")
     
-    def _update_variables_display(self, call_data: dict):
+    def _update_variables_display(self, call_data: dict, comparison_call_data: dict = None):
         """Update the variables tree widget"""
         self._snapshot_tree_expanded()
         self.variables_tree.clear()
@@ -1091,43 +1105,32 @@ class GameExplorerQt(QMainWindow):
                 with open(file_path, encoding='utf-8') as f:
                     content = f.read()
                 
-                # Use Pygments for syntax highlighting if available
-                if PYGMENTS_AVAILABLE:
-                    # Generate HTML with syntax highlighting
-                    formatter = HtmlFormatter(style=PYGMENTS_STYLE, linenos=False, full=False)
-                    highlighted_html = highlight(content, PythonLexer(), formatter)
-                    
-                    # Get CSS for styling
-                    css = formatter.get_style_defs('.highlight')
-                    
-                    # Wrap in HTML with CSS
-                    html = f"""
-                    <style>
-                    {css}
-                    .highlight {{ font-family: Courier, monospace; font-size: 10pt; }}
-                    </style>
-                    <div class="highlight">{highlighted_html}</div>
-                    """
-                    
-                    self.code_editor.setHtml(html)
-                else:
-                    self.code_editor.setPlainText(content)
+                # Block signals to avoid triggering file_modified
+                self.code_editor.blockSignals(True)
+                self.code_editor.setPlainText(content)
+                self.code_editor.blockSignals(False)
                 
                 if highlight_line is not None:
                     self._highlight_line(highlight_line)
                 self.current_source_file = file_path
             else:
+                self.code_editor.blockSignals(True)
                 self.code_editor.setPlainText(f"Source file not found: {file_path or 'Unknown'}")
+                self.code_editor.blockSignals(False)
                 self.current_source_file = None
             self.current_highlighted_line = None
             self.file_modified = False
+            self.save_button.setEnabled(False)
             self._update_code_editor_title()
         except Exception as e:
             print(f"Error loading source code from {file_path}: {e}")
+            self.code_editor.blockSignals(True)
             self.code_editor.setPlainText(f"Error loading source code: {e}")
+            self.code_editor.blockSignals(False)
             self.current_source_file = None
             self.current_highlighted_line = None
             self.file_modified = False
+            self.save_button.setEnabled(False)
             self._update_code_editor_title()
 
     def _highlight_line(self, line_number: int):
@@ -1162,6 +1165,8 @@ class GameExplorerQt(QMainWindow):
         if self.current_source_file:
             filename = os.path.basename(self.current_source_file)
             title = f"Code Editor - {filename}"
+            if self.file_modified:
+                title += " *"
         else:
             title = "Code Editor"
         self.code_editor_frame.setTitle(title)
@@ -1360,9 +1365,31 @@ class GameExplorerQt(QMainWindow):
         except Exception as pygame_err:
             print(f"Warning: Could not close pygame screen: {pygame_err}")
     
+    def _on_code_editor_changed(self):
+        """Handle code editor text changes"""
+        if not self.file_modified and self.current_source_file:
+            self.file_modified = True
+            self.save_button.setEnabled(True)
+            self._update_code_editor_title()
+    
     def _save_current_file(self):
-        """Save current file (placeholder)"""
-        QMessageBox.information(self, "Save", "Save functionality not yet implemented in Qt version")
+        """Save the currently edited file"""
+        if not self.current_source_file:
+            QMessageBox.warning(self, "Save Error", "No file is currently loaded")
+            return
+        
+        try:
+            content = self.code_editor.toPlainText()
+            with open(self.current_source_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            self.file_modified = False
+            self.save_button.setEnabled(False)
+            self._update_code_editor_title()
+            self.status_label.setText(f"Saved: {os.path.basename(self.current_source_file)}")
+            QMessageBox.information(self, "Save Successful", f"File saved: {self.current_source_file}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Failed to save file: {e}")
     
     def run(self):
         """Run the application"""
