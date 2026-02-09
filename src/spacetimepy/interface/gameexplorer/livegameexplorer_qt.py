@@ -21,8 +21,11 @@ from PyQt5.QtWidgets import (
     QScrollArea, QCheckBox, QPushButton, QSpinBox, QGroupBox, QTextEdit,
     QMessageBox, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF, QEvent
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont, QTextCursor, QTextFormat
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF, QEvent, QRegExp
+from PyQt5.QtGui import (
+    QPixmap, QImage, QPainter, QPen, QBrush, QColor, QFont, QTextCursor, 
+    QTextFormat, QSyntaxHighlighter, QTextCharFormat
+)
 
 from PIL import Image
 
@@ -171,6 +174,86 @@ class TwoHandleRangeQt(QWidget):
         painter.setBrush(QBrush(QColor('#ffffff')))
         painter.drawEllipse(QPointF(sx, y), r, r)
         painter.drawEllipse(QPointF(ex, y), r, r)
+
+
+class PythonSyntaxHighlighter(QSyntaxHighlighter):
+    """Simple Python syntax highlighter for the code editor"""
+    
+    def __init__(self, document):
+        super().__init__(document)
+        
+        # Define formatting for different token types
+        self.highlighting_rules = []
+        
+        # Keywords
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(QColor('#0000FF'))
+        keyword_format.setFontWeight(QFont.Bold)
+        keywords = [
+            'and', 'as', 'assert', 'break', 'class', 'continue', 'def',
+            'del', 'elif', 'else', 'except', 'False', 'finally', 'for',
+            'from', 'global', 'if', 'import', 'in', 'is', 'lambda',
+            'None', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return',
+            'True', 'try', 'while', 'with', 'yield', 'async', 'await'
+        ]
+        for keyword in keywords:
+            pattern = QRegExp(f'\\b{keyword}\\b')
+            self.highlighting_rules.append((pattern, keyword_format))
+        
+        # Built-in functions
+        builtin_format = QTextCharFormat()
+        builtin_format.setForeground(QColor('#795E26'))
+        builtins = [
+            'abs', 'all', 'any', 'bin', 'bool', 'bytes', 'chr', 'dict',
+            'dir', 'enumerate', 'filter', 'float', 'format', 'frozenset',
+            'int', 'isinstance', 'len', 'list', 'map', 'max', 'min',
+            'open', 'print', 'range', 'set', 'str', 'sum', 'tuple', 'type', 'zip'
+        ]
+        for builtin in builtins:
+            pattern = QRegExp(f'\\b{builtin}\\b')
+            self.highlighting_rules.append((pattern, builtin_format))
+        
+        # Strings (double-quoted)
+        string_format = QTextCharFormat()
+        string_format.setForeground(QColor('#A31515'))
+        self.highlighting_rules.append((QRegExp('"[^"\\\\]*(\\\\.[^"\\\\]*)*"'), string_format))
+        
+        # Strings (single-quoted)
+        self.highlighting_rules.append((QRegExp("'[^'\\\\]*(\\\\.[^'\\\\]*)*'"), string_format))
+        
+        # Comments
+        comment_format = QTextCharFormat()
+        comment_format.setForeground(QColor('#008000'))
+        comment_format.setFontItalic(True)
+        self.highlighting_rules.append((QRegExp('#[^\n]*'), comment_format))
+        
+        # Numbers
+        number_format = QTextCharFormat()
+        number_format.setForeground(QColor('#098658'))
+        self.highlighting_rules.append((QRegExp('\\b[0-9]+\\b'), number_format))
+        
+        # Function/method definitions
+        function_format = QTextCharFormat()
+        function_format.setForeground(QColor('#795E26'))
+        function_format.setFontWeight(QFont.Bold)
+        self.highlighting_rules.append((QRegExp('\\bdef\\s+([A-Za-z_][A-Za-z0-9_]*)'), function_format))
+        
+        # Class definitions
+        class_format = QTextCharFormat()
+        class_format.setForeground(QColor('#267F99'))
+        class_format.setFontWeight(QFont.Bold)
+        self.highlighting_rules.append((QRegExp('\\bclass\\s+([A-Za-z_][A-Za-z0-9_]*)'), class_format))
+    
+    def highlightBlock(self, text):
+        """Apply syntax highlighting to the given text block"""
+        for pattern, format_style in self.highlighting_rules:
+            expression = QRegExp(pattern)
+            index = expression.indexIn(text)
+            while index >= 0:
+                length = expression.matchedLength()
+                self.setFormat(index, length, format_style)
+                index = expression.indexIn(text, index + length)
+
 
 class GameExplorerQt(QMainWindow):
     """Qt-based Game Explorer for replaying pygame executions"""
@@ -405,10 +488,14 @@ class GameExplorerQt(QMainWindow):
         
         code_editor_layout.addWidget(editor_controls)
         
-        # Code editor (placeholder - chlorophyll is tkinter-based)
+        # Code editor with syntax highlighting
         self.code_editor = QTextEdit()
         self.code_editor.setReadOnly(True)
         self.code_editor.setFont(QFont("Courier", 10))
+        
+        # Apply syntax highlighter
+        self.syntax_highlighter = PythonSyntaxHighlighter(self.code_editor.document())
+        
         code_editor_layout.addWidget(self.code_editor)
         
         right_splitter.addWidget(code_editor_frame)
@@ -422,9 +509,40 @@ class GameExplorerQt(QMainWindow):
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         
+        # General control buttons (not branch-specific)
+        controls_frame = QWidget()
+        controls_layout = QHBoxLayout(controls_frame)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        
+        replay_all_btn = QPushButton("Replay All")
+        replay_all_btn.clicked.connect(self._replay_all)
+        controls_layout.addWidget(replay_all_btn)
+        
+        replay_from_btn = QPushButton("Replay From Here")
+        replay_from_btn.clicked.connect(self._replay_from_here)
+        controls_layout.addWidget(replay_from_btn)
+        
+        replay_range_btn = QPushButton("Replay Range")
+        replay_range_btn.clicked.connect(self._replay_subsequence)
+        controls_layout.addWidget(replay_range_btn)
+        
+        refresh_btn = QPushButton("Refresh DB")
+        refresh_btn.clicked.connect(self._refresh_database)
+        controls_layout.addWidget(refresh_btn)
+        
+        # Hidden pygame checkbox
+        self.hidden_pygame_checkbox = QCheckBox("Hidden Pygame")
+        self.hidden_pygame_checkbox.setChecked(HIDDEN_PYGAME)
+        self.hidden_pygame_checkbox.stateChanged.connect(self._on_hidden_pygame_changed)
+        controls_layout.addWidget(self.hidden_pygame_checkbox)
+        
+        controls_layout.addStretch()
+        
         # Status label
         self.status_label = QLabel("Ready")
-        bottom_layout.addWidget(self.status_label)
+        controls_layout.addWidget(self.status_label)
+        
+        bottom_layout.addWidget(controls_frame)
         
         # Scrollable area for session sliders
         sliders_scroll = QScrollArea()
@@ -489,27 +607,6 @@ class GameExplorerQt(QMainWindow):
             range_label = QLabel(f"Range: 1 - {len(calls)}")
             session_layout.addWidget(range_label)
             
-            # Control buttons
-            controls = QWidget()
-            controls_layout = QHBoxLayout(controls)
-            controls_layout.setContentsMargins(0, 0, 0, 0)
-            
-            replay_btn = QPushButton("Replay All")
-            replay_btn.clicked.connect(lambda _, sid=session_id: self._replay_all(sid))
-            controls_layout.addWidget(replay_btn)
-            
-            replay_from_btn = QPushButton("Replay From Here")
-            replay_from_btn.clicked.connect(lambda _, sid=session_id: self._replay_from_here(sid))
-            controls_layout.addWidget(replay_from_btn)
-            
-            replay_sub_btn = QPushButton("Replay Subsequence")
-            replay_sub_btn.clicked.connect(lambda _, sid=session_id: self._replay_subsequence(sid))
-            controls_layout.addWidget(replay_sub_btn)
-            
-            controls_layout.addStretch()
-            
-            session_layout.addWidget(controls)
-            
             self.sliders_layout.addWidget(session_frame)
             
             # Store references
@@ -528,16 +625,40 @@ class GameExplorerQt(QMainWindow):
         """Handle slider position change"""
         self.current_session_id = session_id
         self.current_call_index = value
+        
+        # Sync parent and child sliders
+        self._sync_parent_slider(session_id, value)
+        self._sync_child_sliders(session_id, value)
+        
         self._update_display()
     
     def _on_range_changed(self, session_id: int, handle: str, value: int):
         """Handle range selector change"""
         if handle == 'start':
             self.range_start[session_id] = value
+            # Ensure start <= end
+            if value > self.range_end[session_id]:
+                self.range_end[session_id] = value
         else:
             self.range_end[session_id] = value
+            # Ensure end >= start
+            if value < self.range_start[session_id]:
+                self.range_start[session_id] = value
 
         self._update_range_label(session_id)
+        
+        # Move main slider to the changed position and update display
+        slider_info = self.session_sliders.get(session_id)
+        if slider_info and 'slider' in slider_info:
+            slider = slider_info['slider']
+            slider.blockSignals(True)  # Prevent recursion
+            slider.setValue(value)
+            slider.blockSignals(False)
+            
+            # Update the display
+            self.current_session_id = session_id
+            self.current_call_index = value
+            self._update_display()
 
     def _update_range_label(self, session_id: int):
         slider_info = self.session_sliders.get(session_id)
@@ -549,6 +670,102 @@ class GameExplorerQt(QMainWindow):
         label = slider_info.get('range_label')
         if label:
             label.setText(f"Range: {start_idx + 1} - {end_idx + 1}")
+    
+    def _sync_parent_slider(self, session_id: int, current_index: int):
+        """Synchronize parent session slider when exploring a branch session"""
+        if session_id not in self.session_relationships:
+            return
+
+        rel = self.session_relationships[session_id]
+        parent_session_id = rel.get('parent_session_id')
+        branch_point_index = rel.get('branch_point_index')
+
+        if parent_session_id and branch_point_index is not None:
+            # Calculate the corresponding position in the parent session
+            parent_index = branch_point_index + current_index
+
+            # Update the parent session slider if it exists
+            if parent_session_id in self.session_sliders:
+                parent_slider = self.session_sliders[parent_session_id]['slider']
+                if parent_slider:
+                    # Check if the parent index is within bounds
+                    parent_calls_count = len(self.sessions_data[parent_session_id]['calls'])
+                    if parent_index < parent_calls_count:
+                        # Block signals to avoid recursion
+                        parent_slider.blockSignals(True)
+                        parent_slider.setValue(parent_index)
+                        parent_slider.blockSignals(False)
+
+    def _sync_child_sliders(self, session_id: int, current_index: int):
+        """Synchronize child session sliders when exploring a parent session"""
+        if session_id not in self.session_relationships:
+            return
+
+        rel = self.session_relationships[session_id]
+        child_sessions = rel.get('child_sessions', [])
+
+        for child_session_id in child_sessions:
+            if child_session_id in self.session_relationships:
+                child_rel = self.session_relationships[child_session_id]
+                branch_point_index = child_rel.get('branch_point_index')
+
+                if branch_point_index is not None and current_index >= branch_point_index:
+                    # Calculate the corresponding position in the child session
+                    child_index = current_index - branch_point_index
+
+                    # Update the child session slider if it exists and the index is valid
+                    if child_session_id in self.session_sliders:
+                        child_slider = self.session_sliders[child_session_id]['slider']
+                        if child_slider:
+                            child_calls_count = len(self.sessions_data[child_session_id]['calls'])
+                            if child_index < child_calls_count:
+                                # Block signals to avoid recursion
+                                child_slider.blockSignals(True)
+                                child_slider.setValue(child_index)
+                                child_slider.blockSignals(False)
+    
+    def _on_hidden_pygame_changed(self, state):
+        """Handle changes to the hidden pygame checkbox"""
+        global HIDDEN_PYGAME
+        HIDDEN_PYGAME = bool(state)
+        print(f"Hidden pygame mode: {'ON' if HIDDEN_PYGAME else 'OFF'}")
+    
+    def _refresh_database(self):
+        """Refresh database and reload sessions"""
+        try:
+            self.status_label.setText("Refreshing database...")
+            QApplication.processEvents()
+            
+            # Close current session
+            if self.session:
+                self.session.close()
+            
+            # Reinitialize database
+            self._init_database()
+            
+            # Clear and recreate UI
+            # Clear existing sliders
+            while self.sliders_layout.count():
+                child = self.sliders_layout.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+            
+            self.session_sliders.clear()
+            self.range_start.clear()
+            self.range_end.clear()
+            
+            # Recreate session sliders
+            self._create_session_sliders()
+            
+            # Update display
+            self._update_display()
+            
+            self.status_label.setText("Database refreshed")
+        except Exception as e:
+            self.status_label.setText(f"Error refreshing: {e}")
+            print(f"Error refreshing database: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _update_display(self):
         """Update all display elements"""
@@ -870,9 +1087,14 @@ class GameExplorerQt(QMainWindow):
         )
         self.image_label.setPixmap(scaled)
     
-    def _replay_all(self, session_id: int):
-        """Replay entire session"""
+    def _replay_all(self):
+        """Replay entire current session"""
         try:
+            if not self.current_session_id:
+                self.status_label.setText("No session selected")
+                return
+                
+            session_id = self.current_session_id
             session_data = self.sessions_data.get(session_id)
             if not session_data:
                 return
@@ -906,9 +1128,14 @@ class GameExplorerQt(QMainWindow):
             with contextlib.suppress(Exception):
                 end_session()
     
-    def _replay_from_here(self, session_id: int):
+    def _replay_from_here(self):
         """Replay from current position"""
         try:
+            if not self.current_session_id:
+                self.status_label.setText("No session selected")
+                return
+                
+            session_id = self.current_session_id
             if session_id not in self.session_sliders:
                 return
             
@@ -949,9 +1176,14 @@ class GameExplorerQt(QMainWindow):
             with contextlib.suppress(Exception):
                 end_session()
     
-    def _replay_subsequence(self, session_id: int):
+    def _replay_subsequence(self):
         """Replay selected subsequence"""
         try:
+            if not self.current_session_id:
+                self.status_label.setText("No session selected")
+                return
+                
+            session_id = self.current_session_id
             start_idx = self.range_start.get(session_id, 0)
             end_idx = self.range_end.get(session_id, 0)
             
