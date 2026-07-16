@@ -24,6 +24,10 @@ dependencies = [
     "networkx>=3.5",
     "sqlalchemy>=2.0.0",
     "tqdm>=4.67.1",
+    "fastapi>=0.115.12",
+    "uvicorn>=0.34.2",
+    "flask>=2.0.0",
+    "flask-cors>=4.0.0"
 ]
 
 [project.scripts]
