@@ -1,8 +1,10 @@
 import base64
 import io
 import random
+
 import pygame
 import spacetimepy
+from spacetimepy.picklers import pygame as pygame_pickler
 
 # Initialize pygame
 pygame.init()
@@ -84,18 +86,19 @@ def reset_game():
     GAME_ACTIVE = True
     SCORE = 0
 
+@spacetimepy.external
 def get_events():
     return pygame.event.get()
 
-def save_screen(m,c,o,r):
+def save_screen(_context: spacetimepy.CaptureReturnContext):
     buffer = io.BytesIO()
     pygame.image.save(pygame.display.get_surface(), buffer, "PNG")
     return {"image": base64.encodebytes(buffer.getvalue()).decode('utf-8')}
 
-@spacetimepy.pymonitor(
-        ignore=['SCREEN','FONT', 'clock'], 
+@spacetimepy.function(
+        #ignore=['SCREEN','FONT', 'clock'], 
         return_hooks=[save_screen],
-        track=[get_events,random.randint])
+        )
 def display_game():
     global GAME_ACTIVE, BIRD_MOVEMENT, pipes
     for event in get_events():
@@ -146,9 +149,12 @@ def display_game():
 
 
 if __name__ == "__main__":
-    monitor = spacetimepy.init_monitoring(db_path="flappy.db", custom_picklers=["pygame"])
-    spacetimepy.start_session("Flappy Bird")
-    while display_game():
-        pass
-    spacetimepy.end_session()
+    space = spacetimepy.SpaceTime.open(
+        "flappy.db",
+        custom_picklers=[pygame_pickler],
+    )
+    with space.capture.recording():
+        while display_game():
+            pass
+    space.close()
     pygame.quit()

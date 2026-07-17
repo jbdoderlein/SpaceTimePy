@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "spacetimepy"
-version = "1.0.0"
+version = "2.0.0"
 description = "SpaceTime Programming engine for Python"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,7 +32,6 @@ dependencies = [
 
 [project.scripts]
 web-spacetimepy = "spacetimepy.interface.web.explorer:main"
-live-game-explorer = "spacetimepy.interface.gameexplorer.livegameexplorer:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/spacetimepy"]
@@ -40,43 +39,6 @@ include = [
     "src/spacetimepy/codediff/download_gumtree.py",
     "src/spacetimepy/codediff/gumtree_utils.py",
 ] 
-
-[tool.uv.sources]
-chlorophyll = { git = "https://github.com/jbdoderlein/chlorophyll" }
-
-[project.optional-dependencies]
-# Optional groups to install only what you need. Example: `pip install .[game]`
-
-game = [
-    "pygame>=2.6.1",
-    "chlorophyll",
-    "sv-ttk>=2.6.1",
-    "pillow>=11.2.1",
-]
-game-qt = [
-    "pygame",
-    "chlorophyll",
-    "PyQt5>=5.15.0",
-    "pillow>=11.2.1",
-    "pygments>=2.0.0",
-]
-visualization = [
-    "matplotlib>=3.10.3",
-    "seaborn>=0.13.2",
-    "pillow>=11.2.1",
-    "fastparquet>=2024.11.0",
-    "scipy>=1.16.0",
-]
-web = [
-    "fastapi>=0.115.12",
-    "uvicorn>=0.34.2",
-    "flask>=2.0.0",
-    "flask-cors>=4.0.0",
-]
-debug = [
-    "debugpy>=1.8.14",
-    "pydevd>=3.3.0",
-]
 
 
 [tool.ruff.lint]
@@ -109,3 +71,6 @@ ignore = [
     "E501",    # Line too long
     "TD003",   # Missing issue link on todo
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

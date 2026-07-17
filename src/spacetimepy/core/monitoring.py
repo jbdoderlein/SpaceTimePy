@@ -1,1291 +1,1193 @@
-import atexit
+"""Low-level VM recorder for the next SpaceTimePy model.
+
+This module deliberately contains no decorator or persistent capture
+declaration.  The public interface layer is responsible for deciding:
+
+* which code objects receive ``sys.monitoring`` events;
+* whether a call is a timeline step, supporting VM call, or external
+  interaction;
+* which line events and variables should be captured;
+* which hooks or replay policies should run.
+
+The interface registers those decisions on the singleton.  The monitor owns
+the ``sys.monitoring`` tool, callbacks, event routing, and the VM-facing state
+required while a program is executing.  It writes directly to the SQLAlchemy
+models, but does not create/export databases, own the ORM session lifecycle,
+query through a repository, or use an ``ObjectManager``.
+
+The ``record_*`` methods remain public so the event boundary can be tested
+without executing monitored code.  A later interface adapter only needs to
+translate decorators into transient calls to ``register_capture``.
+"""
+
+from __future__ import annotations
+
 import datetime
 import dis
+import hashlib
 import inspect
 import json
-import linecache
 import logging
-import os
 import sys
-from time import perf_counter
-import traceback
 import types
-from typing import Any
+import uuid
+from collections.abc import Callable, Collection, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from .function_call import FunctionCallRepository
-from .models import FunctionCall, MonitoringSession, StackSnapshot, StackSnapshotEdge, export_db, init_db
-from .representation import ObjectManager, PickleConfig
+from .model import (
+    CodeDefinition,
+    ExecutionBranch,
+    ExecutionSession,
+    ExecutionStatus,
+    ExecutionStep,
+    ExternalInteractionOccurrence,
+    FunctionCall,
+    FunctionCallOutcome,
+    ObjectIdentity,
+    StackSnapshot,
+    StepKind,
+    StoredObject,
+)
+from .serialization import PickleSerializer
 
-# Configure logging - only show warnings and errors
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
 logger = logging.getLogger(__name__)
 
-MONITOR_TOOL_ID = sys.monitoring.PROFILER_ID
+
+class MonitoringStateError(RuntimeError):
+    """Raised when VM events cannot form a valid trace."""
+
+
+class CallRole(StrEnum):
+    """Transient instruction supplied by the capture interface for a call.
+
+    The role is not persisted.  The resulting models contain all information
+    needed to understand what was recorded.
+    """
+
+    STEP = "step"
+    SUPPORT = "support"
+    EXTERNAL_INTERACTION = "external_interaction"
+
+
+StartAttributes = Callable[
+    ["SpaceTimeMonitor", types.FrameType, types.CodeType, int],
+    Mapping[str, Any] | None,
+]
+ReturnAttributes = Callable[
+    ["SpaceTimeMonitor", types.FrameType, types.CodeType, int, Any],
+    Mapping[str, Any] | None,
+]
+LineAttributes = Callable[
+    ["SpaceTimeMonitor", types.FrameType, types.CodeType, int],
+    Mapping[str, Any] | None,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureRegistration:
+    """Transient capture instruction installed by the interface layer."""
+
+    code: types.CodeType
+    role: CallRole
+    capture_lines: bool = False
+    line_numbers: frozenset[int] | None = None
+    ignored_names: frozenset[str] = frozenset()
+    start_attributes: StartAttributes | None = None
+    return_attributes: ReturnAttributes | None = None
+    line_attributes: LineAttributes | None = None
+
+
+@dataclass
+class _ActiveCall:
+    frame_id: int
+    code: types.CodeType
+    function_call: FunctionCall
+    role: CallRole
+    current_step: ExecutionStep | None = None
+
 
 class SpaceTimeMonitor:
-    _instance = None
+    """Singleton recorder attached to one Python VM and one ORM session.
 
-    _monitored_functions = {}
-    _tracked_functions = {}
+    The singleton may record several branches sequentially.  An ORM session is
+    injected because database creation, export, and disposal belong to the
+    programmatic interface rather than the VM recorder.
 
-    @classmethod
-    def get_instance(cls) -> 'SpaceTimeMonitor | None':
-        """Get the current SpaceTimeMonitor instance.
+    This first version assumes events are delivered from one execution context
+    at a time, as in the existing interactive integrations.
+    Supporting simultaneous threads will require context-local call stacks and
+    ORM sessions, without changing the trace model.
+    """
 
-        Returns:
-            The current SpaceTimeMonitor instance or None if not initialized
-        """
+    _instance: ClassVar[SpaceTimeMonitor | None] = None
+
+    def __new__(
+        cls,
+        database: Session,
+        *,
+        tool_id: int = sys.monitoring.PROFILER_ID,
+        flush_batch_size: int = 256,
+        serializer: PickleSerializer | None = None,
+    ) -> SpaceTimeMonitor:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, db_path="monitoring.db", pickle_config: PickleConfig | None = None, in_memory=True, performance=False):
-        if hasattr(self, 'initialized') and self._instance is not None:
+    def __init__(
+        self,
+        database: Session,
+        *,
+        tool_id: int = sys.monitoring.PROFILER_ID,
+        flush_batch_size: int = 256,
+        serializer: PickleSerializer | None = None,
+    ) -> None:
+        if getattr(self, "_initialized", False):
+            if self.database is not database:
+                raise MonitoringStateError(
+                    "SpaceTimeMonitor is already initialized with another ORM session"
+                )
+            if serializer is not None and self.serializer is not serializer:
+                raise MonitoringStateError(
+                    "SpaceTimeMonitor is already initialized with another serializer"
+                )
             return
-        self.initialized = True
-        self.db_path = db_path
-        self.call_stack : list[FunctionCall] = []  # Stack to keep track of FunctionCall objects instead of just IDs
-        self.MONITOR_TOOL_ID = MONITOR_TOOL_ID
-        self.in_memory = in_memory
-        # Custom pickle configuration
-        self.pickle_config = pickle_config
+        if flush_batch_size < 0:
+            raise ValueError("flush_batch_size must be zero or positive")
 
-        # Recording flag
+        self._initialized = True
+        self.database = database
+        self.tool_id = tool_id
+        self.flush_batch_size = flush_batch_size
+        self.serializer = serializer or PickleSerializer()
+        self.is_recording_enabled = True
+        self.last_callback_error: BaseException | None = None
+
+        self.current_session: ExecutionSession | None = None
+        self.current_branch: ExecutionBranch | None = None
+
+        self._captures: dict[types.CodeType, CaptureRegistration] = {}
+        self._active_calls: list[_ActiveCall] = []
+        self._active_calls_by_frame: dict[int, _ActiveCall] = {}
+        self._next_step_position = 0
+        self._next_external_positions: dict[int, int] = {}
+        self._pending_events = 0
+        self._inside_callback = False
+
+        self._code_definition_cache: dict[types.CodeType, str | None] = {}
+        self._known_code_definition_ids: set[str] = set()
+        self._global_names_cache: dict[types.CodeType, frozenset[str]] = {}
+        self._identity_cache: dict[str, ObjectIdentity] = {}
+        self._stored_value_cache: dict[tuple[str, str], str] = {}
+        self._next_object_versions: dict[str, int] = {}
+        self._identity_namespace = uuid.uuid4().hex
+
+        self._install_monitoring_tool()
+
+    @classmethod
+    def get_instance(cls) -> SpaceTimeMonitor | None:
+        return cls._instance
+
+    @property
+    def active_calls(self) -> tuple[FunctionCall, ...]:
+        """Return the captured calls currently active in the VM."""
+
+        return tuple(active.function_call for active in self._active_calls)
+
+    @property
+    def captures(self) -> tuple[CaptureRegistration, ...]:
+        """Return the transient capture registrations currently installed."""
+
+        return tuple(self._captures.values())
+
+    def register_capture(
+        self,
+        target: types.CodeType | Callable[..., Any],
+        *,
+        role: CallRole = CallRole.STEP,
+        capture_lines: bool = False,
+        line_numbers: Collection[int] | None = None,
+        ignored_names: Collection[str] = (),
+        start_attributes: StartAttributes | None = None,
+        return_attributes: ReturnAttributes | None = None,
+        line_attributes: LineAttributes | None = None,
+    ) -> CaptureRegistration:
+        """Install an in-memory capture instruction and enable its VM events.
+
+    Decorators in the public interface layer call this method.  No
+        registration is written to the trace database.
+        """
+
+        code = self._code_from_target(target)
+        role = CallRole(role)
+        selected_lines = (
+            None if line_numbers is None else frozenset(line_numbers)
+        )
+        capture_lines = capture_lines or selected_lines is not None
+        if role == CallRole.EXTERNAL_INTERACTION and capture_lines:
+            raise ValueError("External interaction captures cannot include line events")
+
+        registration = CaptureRegistration(
+            code=code,
+            role=role,
+            capture_lines=capture_lines,
+            line_numbers=selected_lines,
+            ignored_names=frozenset(ignored_names),
+            start_attributes=start_attributes,
+            return_attributes=return_attributes,
+            line_attributes=line_attributes,
+        )
+        self._captures[code] = registration
+
+        # Source inspection and bytecode analysis are registration-time work,
+        # not costs to pay on the first monitored invocation.
+        self._store_code_definition(code)
+        self._global_names_for_code(code)
+
+        events = (
+            sys.monitoring.events.PY_START
+            | sys.monitoring.events.PY_RETURN
+        )
+        if capture_lines:
+            events |= sys.monitoring.events.LINE
+        sys.monitoring.set_local_events(self.tool_id, code, events)
+        self._refresh_global_events()
+        return registration
+
+    def unregister_capture(
+        self,
+        target: types.CodeType | Callable[..., Any],
+    ) -> CaptureRegistration | None:
+        """Disable VM events and remove one transient capture instruction."""
+
+        code = self._code_from_target(target)
+        sys.monitoring.set_local_events(self.tool_id, code, 0)
+        registration = self._captures.pop(code, None)
+        self._refresh_global_events()
+        return registration
+
+    def clear_captures(self) -> None:
+        """Disable every code-local event registered on this monitor."""
+
+        for code in tuple(self._captures):
+            sys.monitoring.set_local_events(self.tool_id, code, 0)
+        self._captures.clear()
+        self._refresh_global_events()
+
+    def _refresh_global_events(self) -> None:
+        # PY_UNWIND is not a valid code-local event.  It is rare compared with
+        # starts and lines; the callback rejects untracked frames in O(1).
+        events = sys.monitoring.events.PY_UNWIND if self._captures else 0
+        sys.monitoring.set_events(self.tool_id, events)
+
+    def _install_monitoring_tool(self) -> None:
+        tool_name = sys.monitoring.get_tool(self.tool_id)
+        if tool_name is None:
+            sys.monitoring.use_tool_id(self.tool_id, "spacetimepy")
+        elif tool_name != "spacetimepy":
+            raise MonitoringStateError(
+                f"sys.monitoring tool ID {self.tool_id} is already used by {tool_name!r}"
+            )
+
+        sys.monitoring.set_events(self.tool_id, 0)
+        sys.monitoring.register_callback(
+            self.tool_id,
+            sys.monitoring.events.PY_START,
+            self._monitor_callback_function_start,
+        )
+        sys.monitoring.register_callback(
+            self.tool_id,
+            sys.monitoring.events.PY_RETURN,
+            self._monitor_callback_function_return,
+        )
+        sys.monitoring.register_callback(
+            self.tool_id,
+            sys.monitoring.events.PY_UNWIND,
+            self._monitor_callback_function_unwind,
+        )
+        sys.monitoring.register_callback(
+            self.tool_id,
+            sys.monitoring.events.LINE,
+            self._monitor_callback_line,
+        )
+
+    def _uninstall_monitoring_tool(self) -> None:
+        self.clear_captures()
+        sys.monitoring.set_events(self.tool_id, 0)
+        for event in (
+            sys.monitoring.events.PY_START,
+            sys.monitoring.events.PY_RETURN,
+            sys.monitoring.events.PY_UNWIND,
+            sys.monitoring.events.LINE,
+        ):
+            sys.monitoring.register_callback(self.tool_id, event, None)
+        if sys.monitoring.get_tool(self.tool_id) == "spacetimepy":
+            sys.monitoring.free_tool_id(self.tool_id)
+
+    def _monitor_callback_function_start(
+        self,
+        code: types.CodeType,
+        instruction_offset: int,
+    ) -> None:
+        registration = self._captures.get(code)
+        if (
+            registration is None
+            or not self.is_recording_enabled
+            or self.current_branch is None
+            or self._inside_callback
+        ):
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None:
+            return
+        if (
+            registration.role == CallRole.EXTERNAL_INTERACTION
+            and self._nearest_owner_step(frame.f_back) is None
+        ):
+            return
+
+        self._inside_callback = True
+        try:
+            attributes = self._call_start_attributes(
+                registration, frame, instruction_offset
+            )
+            self.record_function_start(
+                frame,
+                code=code,
+                instruction_offset=instruction_offset,
+                role=registration.role,
+                ignored_names=registration.ignored_names,
+                attributes=attributes,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def _monitor_callback_function_return(
+        self,
+        code: types.CodeType,
+        instruction_offset: int,
+        return_value: Any,
+    ) -> None:
+        if self._inside_callback:
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None or id(frame) not in self._active_calls_by_frame:
+            return
+
+        self._inside_callback = True
+        try:
+            registration = self._captures.get(code)
+            attributes = self._call_return_attributes(
+                registration,
+                frame,
+                code,
+                instruction_offset,
+                return_value,
+            )
+            self.record_function_return(
+                frame,
+                return_value,
+                attributes=attributes,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def _monitor_callback_function_unwind(
+        self,
+        code: types.CodeType,
+        instruction_offset: int,
+        exception: BaseException,
+    ) -> None:
+        if self._inside_callback:
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None or id(frame) not in self._active_calls_by_frame:
+            return
+
+        self._inside_callback = True
+        try:
+            registration = self._captures.get(code)
+            attributes = self._call_return_attributes(
+                registration,
+                frame,
+                code,
+                instruction_offset,
+                exception,
+            )
+            self.record_function_unwind(
+                frame,
+                exception,
+                attributes=attributes,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def _monitor_callback_line(
+        self,
+        code: types.CodeType,
+        line_number: int,
+    ) -> None:
+        registration = self._captures.get(code)
+        if (
+            registration is None
+            or not registration.capture_lines
+            or not self.is_recording_enabled
+            or self.current_branch is None
+            or self._inside_callback
+            or (
+                registration.line_numbers is not None
+                and line_number not in registration.line_numbers
+            )
+        ):
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None:
+            return
+
+        self._inside_callback = True
+        try:
+            attributes = self._call_line_attributes(
+                registration, frame, line_number
+            )
+            self.record_stack_snapshot(
+                frame,
+                line_number,
+                code=code,
+                ignored_names=registration.ignored_names,
+                attributes=attributes,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def start_branch(self, branch: ExecutionBranch) -> ExecutionBranch:
+        """Attach the recorder to an existing or newly constructed branch.
+
+        The branch must already reference its :class:`ExecutionSession`.  The
+        interface is responsible for constructing the session, root/child
+        branch, and fork relation before recording begins.
+        """
+
+        if self._active_calls:
+            raise MonitoringStateError(
+                "Cannot change branch while captured function calls are active"
+            )
+        if branch.session is None:
+            raise MonitoringStateError("The branch must belong to an execution session")
+
+        branch.status = ExecutionStatus.OPEN
+        branch.completed_at = None
+        if branch.session.status != ExecutionStatus.OPEN:
+            branch.session.status = ExecutionStatus.OPEN
+            branch.session.completed_at = None
+
+        self.database.add(branch)
+        last_position = max(
+            (step.position for step in branch.steps),
+            default=-1,
+        )
+
+        self.current_session = branch.session
+        self.current_branch = branch
+        self._next_step_position = last_position + 1
+        self._next_external_positions.clear()
+        return branch
+
+    def finish_branch(
+        self,
+        status: ExecutionStatus = ExecutionStatus.COMPLETED,
+        *,
+        commit: bool = False,
+    ) -> ExecutionBranch:
+        """Finish the active branch without closing the injected ORM session."""
+
+        branch = self._require_branch()
+        if self._active_calls:
+            names = ", ".join(
+                active.function_call.qualified_name
+                or active.function_call.function_name
+                for active in self._active_calls
+            )
+            raise MonitoringStateError(
+                f"Cannot finish branch with active calls: {names}"
+            )
+
+        branch.status = status
+        branch.completed_at = (
+            None if status == ExecutionStatus.OPEN else self._now()
+        )
+        self.database.flush()
+        if commit:
+            self.database.commit()
+
+        self.current_branch = None
+        self.current_session = None
+        self._next_external_positions.clear()
+        self._pending_events = 0
+        return branch
+
+    def enable_recording(self) -> None:
         self.is_recording_enabled = True
 
-        # Current session information
-        self.current_session : MonitoringSession | None = None  # Current monitoring session
-        self.session_function_calls = {}  # Dict mapping function names to lists of call IDs
-        self._current_session_first_call_id = None # ID of the first call in the current session chain
-        self._current_session_last_call_id = None  # ID of the last call in the current session chain
-        self._parent_id_for_next_call: int | None = None
-
-        # Performance optimization: In-memory counters to avoid database queries
-        self._current_session_call_count = 0  # Counter for order_in_session
-        self._parent_call_child_counts = {}  # Dict[parent_id, child_count] for order_in_parent
-        self._function_snapshot_counts = {}  # Dict[function_call_id, snapshot_count] for order_in_call
-
-        # Performance optimization: Multi-layered caching for get_used_globals
-        self._bytecode_cache = {}  # Cache for static bytecode analysis (code -> set of accessed names)
-        self._type_cache = {}  # Cache for type checking results (id(obj) -> type_info)
-        self._type_cache_max_size = 10000  # Prevent memory leaks
-        self._globals_result_cache = {}  # Cache for final results (code_id + globals_hash -> result)
-
-        # Performance optimization: Cache for code definitions to avoid expensive inspect operations
-        self._code_definition_cache = {}  # Cache for code definition results (func_obj -> {code_def_id, mtime, module_path})
-
-        # Functions to skip one line snapshot (e.g. hotswap function trampoline skip frame)
-        self.skip_one_line_snapshot = set()
-
-        # Initialize the database and managers
-        try:
-            # First, initialize the database and ensure tables are created
-            Session = init_db(self.db_path, in_memory)
-
-            # Initialize the function call tracker
-            self.session = Session()
-
-            self.call_tracker = FunctionCallRepository(self.session, pickle_config=self.pickle_config)
-            self.object_manager = ObjectManager(self.session, pickle_config=self.pickle_config)
-
-            logger.info(f"Database initialized successfully at {self.db_path}")
-        except Exception as e:
-            logger.error(f"Failed to initialize database: {e}")
-            logger.error(traceback.format_exc())
-            self.call_tracker = None
-
-        try:
-            if sys.monitoring.get_tool(self.MONITOR_TOOL_ID) is None:
-                sys.monitoring.use_tool_id(self.MONITOR_TOOL_ID, "py_monitoring")
-
-            sys.monitoring.register_callback(
-                self.MONITOR_TOOL_ID,
-                sys.monitoring.events.PY_START,
-                self.monitor_callback_function_start
-            )
-
-            sys.monitoring.register_callback(
-                self.MONITOR_TOOL_ID,
-                sys.monitoring.events.PY_RETURN,
-                self.monitor_callback_function_return
-            )
-
-            sys.monitoring.register_callback(
-                self.MONITOR_TOOL_ID,
-                sys.monitoring.events.LINE,
-                self.monitor_callback_line
-            )
-
-            logger.info("Registered monitoring callbacks")
-        except Exception as e:
-            logger.error(f"Failed to register monitoring callbacks: {e}")
-
-        self.performance = performance
-        if self.performance:
-            logger.info("Performance monitoring enabled")
-            # Additional performance monitoring setup can go here
-            self.performance_data = {
-                "function_starts": [],
-                "function_returns": [],
-                "line_events": [],
-                "line_failed_serialization": 0,
-                "line_failed_type": set(),
-                "line_captured_locals": 0,
-                "function_failed_serialization": 0,
-                "function_failed_type": set(),
-                "function_captured_locals": 0,
-            }
-
-        SpaceTimeMonitor._instance = self
-        logger.info("Monitoring initialized successfully")
-
-    def shutdown(self):
-        """Gracefully shut down monitoring"""
-        logger.info("Starting SpaceTimeMonitor shutdown")
-        if self.performance:
-            with open("monitoring_performance.json", "w") as f:
-                self.performance_data["line_failed_type"] = [str(t) for t in self.performance_data["line_failed_type"]]
-                self.performance_data["function_failed_type"] = [str(t) for t in self.performance_data["function_failed_type"]]
-                json.dump(self.performance_data, f)
-
-        if hasattr(self, 'session'):
-            try:
-                logger.info("Committing final changes and closing session")
-                if self.in_memory:
-                    self.export_db()
-                    self.session.commit()
-                    self.session.close()
-                logger.info("Database session closed")
-            except Exception as e:
-                logger.error(f"Error during monitoring shutdown: {e}")
-                logger.error(traceback.format_exc())
-        logger.info("SpaceTimeMonitor shutdown completed")
-
-    def disable_recording(self):
-        """Temporarily disable recording of function calls and line execution.
-
-        This can be useful when you want to run code without monitoring overhead
-        or when you want to exclude certain parts of your program from monitoring.
-        """
-        logger.info("Disabling monitoring recording")
+    def disable_recording(self) -> None:
         self.is_recording_enabled = False
 
-    def enable_recording(self):
-        """Re-enable recording of function calls and line execution.
+    @contextmanager
+    def recording_disabled(self):
+        """Temporarily ignore new calls and line events."""
 
-        Call this after disable_recording() to resume monitoring.
+        was_enabled = self.is_recording_enabled
+        self.is_recording_enabled = False
+        try:
+            yield
+        finally:
+            self.is_recording_enabled = was_enabled
+
+    def flush(self) -> None:
+        self.database.flush()
+        self._pending_events = 0
+
+    def commit(self) -> None:
+        self.database.commit()
+        self._pending_events = 0
+
+    def rollback(self) -> None:
+        self.database.rollback()
+        self._pending_events = 0
+        self._active_calls.clear()
+        self._active_calls_by_frame.clear()
+
+    def shutdown(self, *, commit: bool = False) -> None:
+        """Detach the singleton without closing the interface-owned session."""
+
+        self._uninstall_monitoring_tool()
+        if self._active_calls:
+            logger.warning(
+                "Discarding %d active monitoring call(s) during shutdown",
+                len(self._active_calls),
+            )
+        if commit:
+            self.database.commit()
+        else:
+            self.database.flush()
+        self._pending_events = 0
+
+        self._active_calls.clear()
+        self._active_calls_by_frame.clear()
+        self.current_branch = None
+        self.current_session = None
+        self._initialized = False
+        type(self)._instance = None
+
+    def record_function_start(
+        self,
+        frame: types.FrameType,
+        *,
+        code: types.CodeType | None = None,
+        instruction_offset: int | None = None,
+        role: CallRole = CallRole.SUPPORT,
+        ignored_names: Collection[str] = (),
+        attributes: Mapping[str, Any] | None = None,
+        source_step: ExecutionStep | None = None,
+    ) -> FunctionCall | None:
+        """Record a selected ``PY_START`` event.
+
+        ``role`` is supplied by the interface and is intentionally transient:
+
+        * ``STEP`` creates a function-call step, or enables snapshot steps for
+          this frame, according to the active session's ``step_kind``;
+        * ``SUPPORT`` stores only the VM call;
+        * ``EXTERNAL_INTERACTION`` stores the VM call and appends an ordered
+          occurrence to the currently executing step.
         """
-        logger.info("Enabling monitoring recording")
-        self.is_recording_enabled = True
 
-    def export_db(self):
-        """Exports the current monitoring database to a specified file.
-
-        This is particularly useful when using an in-memory database (":memory:")
-        to persist the collected data before the application exits.
-
-        Args:
-            target_file_path: The path to the file where the database should be saved.
-
-        Raises:
-            ValueError: If the monitoring session is not available or the database
-                        connection cannot be established.
-            Exception: Any exceptions raised during the database backup process.
-        """
-        export_db(self.session, self.db_path)
-
-    def clear_caches(self):
-        """Clear all performance caches. Useful for memory management."""
-        self._bytecode_cache.clear()
-        self._type_cache.clear()
-        self._globals_result_cache.clear()
-        self._function_snapshot_counts.clear()
-        self._code_definition_cache.clear()
-        logger.info("Cleared all performance caches")
-
-    def start_session(self, name=None, description=None, metadata=None):
-        """Start a new monitoring session to group function calls.
-
-        Args:
-            name: Optional name for the session
-            description: Optional description for the session
-            metadata: Optional metadata dictionary for additional information
-
-        Returns:
-            The session ID (int) of the new session or None if session creation failed
-        """
-        if self.call_tracker is None:
-            logger.warning("Call tracker is not initialized. Session will not be created.")
+        if not self.is_recording_enabled:
             return None
+        execution_session = self._require_session()
+        self._require_branch()
 
-        # Commit any pending changes to ensure data consistency
-        try:
-            self.session.commit()
-        except Exception as e:
-            logger.error(f"Error committing session before starting new monitoring session: {e}")
-            self.session.rollback()
-
-        # Create a new session
-        try:
-            new_session = MonitoringSession(
-                name=name,
-                description=description,
-                start_time=datetime.datetime.now(),
-                session_metadata=metadata or {},
+        code = code or frame.f_code
+        role = CallRole(role)
+        frame_id = id(frame)
+        if frame_id in self._active_calls_by_frame:
+            raise MonitoringStateError(
+                f"Frame for {code.co_qualname} has already been recorded"
             )
 
-            self.session.add(new_session)
-            self.session.commit()
+        owner_step = None
+        if role == CallRole.EXTERNAL_INTERACTION:
+            owner_step = self._nearest_owner_step(frame.f_back)
+            if owner_step is None:
+                raise MonitoringStateError(
+                    f"External interaction {code.co_qualname} occurred outside "
+                    "an active execution step"
+                )
 
-            self.current_session = new_session
-            self.session_function_calls = {}  # Reset the function calls map
-            # Reset linked list trackers for the new session
-            self._current_session_first_call_id = None
-            self._current_session_last_call_id = None
+        ignored = frozenset(ignored_names)
+        local_refs, local_errors = self._capture_mapping(frame.f_locals, ignored)
+        globals_used = self._used_globals(code, frame.f_globals)
+        global_refs, global_errors = self._capture_mapping(globals_used, ignored)
 
-            # Reset performance counters
-            self._current_session_call_count = 0
-            self._parent_call_child_counts = {}
-            self._function_snapshot_counts = {}
-            # Note: Don't reset bytecode cache or code definition cache as they're static
-            # Only clear type cache for new session (objects may change)
-            self._type_cache = {}
+        call_attributes = dict(attributes or {})
+        if instruction_offset is not None:
+            call_attributes.setdefault("entry_instruction_offset", instruction_offset)
+        capture_errors = {**local_errors, **global_errors}
+        if capture_errors:
+            call_attributes["capture_errors"] = capture_errors
 
-            logger.info(f"Started new monitoring session {new_session.id}: {name}")
-            return new_session.id
+        captured_caller = self._nearest_active_call(frame.f_back)
 
-        except Exception as e:
-            logger.error(f"Error creating new monitoring session: {e}")
-            logger.error(traceback.format_exc())
-            self.session.rollback()
+        function_call = FunctionCall(
+            function_name=code.co_name,
+            qualified_name=code.co_qualname,
+            module_name=frame.f_globals.get("__name__"),
+            file_path=code.co_filename,
+            first_line_number=code.co_firstlineno,
+            started_at=self._now(),
+            outcome=FunctionCallOutcome.RUNNING,
+            entry_locals_refs=local_refs,
+            entry_globals_refs=global_refs,
+            attributes=call_attributes,
+            code_definition_id=self._store_code_definition(code),
+            caller_call=(
+                captured_caller.function_call if captured_caller is not None else None
+            ),
+        )
+        self.database.add(function_call)
+
+        active = _ActiveCall(
+            frame_id=frame_id,
+            code=code,
+            function_call=function_call,
+            role=role,
+        )
+        self._active_calls.append(active)
+        self._active_calls_by_frame[frame_id] = active
+
+        if role == CallRole.STEP and execution_session.step_kind == StepKind.FUNCTION_CALL:
+            active.current_step = self._create_step(
+                kind=StepKind.FUNCTION_CALL,
+                function_call=function_call,
+                source_step=source_step,
+            )
+        elif role == CallRole.EXTERNAL_INTERACTION:
+            occurrence = ExternalInteractionOccurrence(
+                step=owner_step,
+                function_call=function_call,
+                position=self._take_external_position(owner_step),
+            )
+            self.database.add(occurrence)
+
+        self._mark_event_recorded()
+        return function_call
+
+    def record_stack_snapshot(
+        self,
+        frame: types.FrameType,
+        line_number: int,
+        *,
+        code: types.CodeType | None = None,
+        instruction_offset: int | None = None,
+        ignored_names: Collection[str] = (),
+        attributes: Mapping[str, Any] | None = None,
+        source_step: ExecutionStep | None = None,
+    ) -> StackSnapshot | None:
+        """Record a selected ``LINE`` event for an active captured frame."""
+
+        if not self.is_recording_enabled:
             return None
+        execution_session = self._require_session()
+        self._require_branch()
 
-    def end_session(self):
-        """End the current monitoring session.
+        code = code or frame.f_code
+        active = self._active_calls_by_frame.get(id(frame))
+        if active is None:
+            raise MonitoringStateError(
+                f"Cannot record a snapshot for inactive frame {code.co_qualname}"
+            )
 
-        Returns:
-            The session ID (int) of the completed session or None if no session was active
-        """
-        if self.current_session is None:
-            logger.warning("No active monitoring session to end.")
+        ignored = frozenset(ignored_names)
+        local_refs, local_errors = self._capture_mapping(frame.f_locals, ignored)
+        globals_used = self._used_globals(code, frame.f_globals)
+        global_refs, global_errors = self._capture_mapping(globals_used, ignored)
+
+        snapshot_attributes = dict(attributes or {})
+        capture_errors = {**local_errors, **global_errors}
+        if capture_errors:
+            snapshot_attributes["capture_errors"] = capture_errors
+
+        snapshot = StackSnapshot(
+            function_call=active.function_call,
+            code_definition_id=self._store_code_definition(code),
+            line_number=line_number,
+            instruction_offset=instruction_offset,
+            captured_at=self._now(),
+            locals_refs=local_refs,
+            globals_refs=global_refs,
+            attributes=snapshot_attributes,
+        )
+        self.database.add(snapshot)
+
+        if (
+            active.role == CallRole.STEP
+            and execution_session.step_kind == StepKind.STACK_SNAPSHOT
+        ):
+            active.current_step = self._create_step(
+                kind=StepKind.STACK_SNAPSHOT,
+                stack_snapshot=snapshot,
+                source_step=source_step,
+            )
+
+        self._mark_event_recorded()
+        return snapshot
+
+    def record_function_return(
+        self,
+        frame: types.FrameType,
+        return_value: Any,
+        *,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> FunctionCall | None:
+        """Record a selected ``PY_RETURN`` event and close its VM call."""
+
+        active = self._active_calls_by_frame.get(id(frame))
+        if active is None:
             return None
+        self._ensure_top_active(active)
 
-        session_id = self.current_session.id
-
+        call = active.function_call
+        return_ref = None
+        return_error = None
         try:
-            # Update the session with end time
-            setattr(self.current_session, 'end_time', datetime.datetime.now())
+            return_ref = self._store_value(return_value)
+        except Exception as error:  # noqa: BLE001 - capture must not hide the call
+            return_error = f"{type(error).__name__}: {error}"
 
-            # Set the entry point for the session's call chain
-            if self._current_session_first_call_id is not None:
-                logger.info(f"Setting entry point for session {session_id} to call {self._current_session_first_call_id}")
-                setattr(self.current_session, 'entry_point_call_id', self._current_session_first_call_id)
-            else:
-                logger.warning(f"No first function call recorded for session {session_id}. Entry point not set.")
+        call.return_ref = return_ref
+        call.exception_ref = None
+        call.outcome = FunctionCallOutcome.RETURNED
+        call.completed_at = self._now()
+        self._merge_call_attributes(call, attributes, "return", return_error)
 
-            # Commit the changes including the entry point
-            self.session.commit()
+        self._remove_active(active)
+        self._mark_event_recorded()
+        return call
 
-            logger.info(f"Ended monitoring session {session_id}")
+    def record_function_unwind(
+        self,
+        frame: types.FrameType,
+        exception: BaseException,
+        *,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> FunctionCall | None:
+        """Record a selected ``PY_UNWIND`` event and its raised exception."""
 
-            # Reset current session and linked list trackers
-            self.current_session = None
-            self.session_function_calls = {}
-            self._current_session_first_call_id = None
-            self._current_session_last_call_id = None
-
-            # Reset performance counters
-            self._current_session_call_count = 0
-            self._parent_call_child_counts = {}
-            self._function_snapshot_counts = {}
-            # Note: Don't reset bytecode cache or code definition cache as they're static
-            # Only clear type cache for new session (objects may change)
-            self._type_cache = {}
-
-            return session_id
-
-        except Exception as e:
-            logger.error(f"Error ending monitoring session: {e}")
-            logger.error(traceback.format_exc())
-            self.session.rollback()
+        active = self._active_calls_by_frame.get(id(frame))
+        if active is None:
             return None
+        self._ensure_top_active(active)
 
-    def add_function_call_to_session(self, function_name, call_id):
-        """Add a function call to the current session.
-
-        Args:
-            function_name: Name of the function
-            call_id: ID of the function call
-        """
-        if self.current_session is None or call_id is None:
-            return
-
-        # Initialize the list for this function if it doesn't exist
-        if function_name not in self.session_function_calls:
-            self.session_function_calls[function_name] = []
-
-        # Add the call ID to the list
-        self.session_function_calls[function_name].append(call_id)
-
-    def _store_variables(self, variables: dict[str, Any]) -> dict[str, str]:
-        """Store variables and return a dictionary of variable names to object references"""
-        refs = {}
-        for name, value in variables.items():
-            # Skip special variables and functions
-            if name.startswith('__') or callable(value):
-                continue
-            try:
-                # Store the value and get its reference
-                ref = self.object_manager.store(value)
-                # Always store the reference, not the value
-                refs[name] = ref
-            except Exception as e:
-                # Log warning but continue if we can't store a variable
-                refs[name] = "<unserializable>"
-                if self.performance:
-                    self.performance_data["function_failed_serialization"] += 1
-                    self.performance_data["function_failed_type"].add(type(value))
-        return refs
-
-    def _get_cached_code_definition(self, func_obj, code_name: str) -> str | None:
-        """Get cached code definition ID for a function object (performance optimization)
-
-        Checks file modification time to ensure cache validity when source files change.
-
-        Args:
-            func_obj: The function object to get code definition for
-            code_name: Name of the code object (for fallback)
-
-        Returns:
-            Code definition ID or None if not available
-        """
-        # Check if call_tracker is available
-        if self.call_tracker is None:
-            return None
-
-        # Get the module path first to check modification time
-        module_path = None
+        call = active.function_call
+        exception_ref = None
+        exception_error = None
         try:
-            if inspect.isfunction(func_obj):
-                module = inspect.getmodule(func_obj)
-                module_path = module.__file__ if module and hasattr(module, '__file__') else None
-        except Exception:
-            pass
+            exception_ref = self._store_value(exception)
+        except Exception as error:  # noqa: BLE001 - capture must not hide the call
+            exception_error = f"{type(error).__name__}: {error}"
 
-        # If no module path, we can't cache effectively
-        if not module_path:
-            return self._compute_code_definition(func_obj, code_name, None)
+        call.return_ref = None
+        call.exception_ref = exception_ref
+        call.outcome = FunctionCallOutcome.RAISED
+        call.completed_at = self._now()
+        self._merge_call_attributes(call, attributes, "exception", exception_error)
 
-        # Check cache and file modification time
-        cache_entry = self._code_definition_cache.get(func_obj)
-        if cache_entry is not None:
-            cached_mtime = cache_entry.get('mtime')
-            cached_path = cache_entry.get('module_path')
+        self._remove_active(active)
+        self._mark_event_recorded()
+        return call
 
-            # Only use cache if the file path matches and hasn't been modified
-            if cached_path == module_path and cached_mtime is not None:
-                try:
-                    current_mtime = os.path.getmtime(module_path)
-                    if current_mtime <= cached_mtime:
-                        # File hasn't changed, use cached result
-                        return cache_entry.get('code_def_id')
-                except OSError:
-                    # File doesn't exist or can't be accessed, invalidate cache
-                    pass
+    def _create_step(
+        self,
+        *,
+        kind: StepKind,
+        function_call: FunctionCall | None = None,
+        stack_snapshot: StackSnapshot | None = None,
+        source_step: ExecutionStep | None = None,
+    ) -> ExecutionStep:
+        branch = self._require_branch()
+        position = self._next_step_position
 
-        # Cache miss or file changed, compute new result
-        return self._compute_code_definition(func_obj, code_name, module_path)
+        if position == 0 and branch.parent_branch is not None:
+            if source_step is None:
+                source_step = branch.forked_from_step
+            if source_step is not branch.forked_from_step:
+                raise MonitoringStateError(
+                    "The first child-branch step must source its forked-from step"
+                )
 
-    def _compute_code_definition(self, func_obj, code_name: str, module_path: str | None) -> str | None:
-        """Compute and cache code definition ID for a function object"""
-        code_def_id = None
-        current_mtime = None
+        step = ExecutionStep(
+            branch=branch,
+            position=position,
+            kind=kind,
+            function_call=function_call,
+            stack_snapshot=stack_snapshot,
+            source_step=source_step,
+        )
+        self.database.add(step)
+        self._next_step_position += 1
+        return step
 
-        # Check if call_tracker is available
-        if self.call_tracker is None:
-            return None
+    def _take_external_position(self, step: ExecutionStep) -> int:
+        step_key = id(step)
+        if step_key not in self._next_external_positions:
+            last_position = max(
+                (occurrence.position for occurrence in step.external_interactions),
+                default=-1,
+            )
+            self._next_external_positions[step_key] = last_position + 1
 
-        try:
-            # Do expensive inspect operations
-            if inspect.isfunction(func_obj):
-                source_code = inspect.getsource(func_obj)
-                first_line_no = inspect.getsourcelines(func_obj)[1]  # This gets the starting line number
+        position = self._next_external_positions[step_key]
+        self._next_external_positions[step_key] = position + 1
+        return position
 
-                # Get module path if not provided
-                if module_path is None:
-                    module = inspect.getmodule(func_obj)
-                    module_path = module.__file__ if module and hasattr(module, '__file__') else None
+    def _nearest_active_call(
+        self,
+        frame: types.FrameType | None,
+    ) -> _ActiveCall | None:
+        """Find the closest captured caller through unmonitored frames."""
 
-                # Get file modification time for caching
-                if module_path:
-                    try:
-                        current_mtime = os.path.getmtime(module_path)
-                    except OSError:
-                        current_mtime = None
-
-                # Only store code definition if we have all required info
-                if module_path:
-                    # Get code definition ID by storing/retrieving
-                    code_def_id = self.call_tracker.object_manager.store_code_definition(
-                        name=code_name,
-                        type='function',
-                        module_path=module_path,
-                        code_content=source_code,
-                        first_line_no=first_line_no
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to capture function code for {code_name}: {e}")
-
-        # Cache the result with modification time
-        self._code_definition_cache[func_obj] = {
-            'code_def_id': code_def_id,
-            'mtime': current_mtime,
-            'module_path': module_path
-        }
-
-        return code_def_id
-
-    def _resolve_function_object(self, frame, code: types.CodeType):
-        """Resolve the live function object for an executing frame/code pair."""
-        func_obj = frame.f_globals.get(code.co_name)
-        if callable(func_obj) and getattr(func_obj, "__code__", None) is code:
-            return func_obj
-
-        module = inspect.getmodule(frame)
-        qualname_parts = code.co_qualname.split(".")
-        if module is not None:
-            candidate = module
-            for part in qualname_parts:
-                if part == "<locals>":
-                    candidate = None
-                    break
-                candidate = getattr(candidate, part, None)
-                if candidate is None:
-                    break
-            if callable(candidate) and getattr(candidate, "__code__", None) is code:
-                return candidate
-
-        owner = frame.f_locals.get("self")
-        if owner is not None:
-            candidate = getattr(owner.__class__, code.co_name, None)
-            if callable(candidate) and getattr(candidate, "__code__", None) is code:
-                return candidate
-
-        return func_obj if callable(func_obj) else None
-
-    def _get_code_definition_for_frame(self, frame, code: types.CodeType) -> str | None:
-        """Get the code definition ID for the currently executing code object."""
-        func_obj = self._resolve_function_object(frame, code)
-        if func_obj is not None:
-            return self._get_cached_code_definition(func_obj, code.co_name)
+        while frame is not None:
+            active = self._active_calls_by_frame.get(id(frame))
+            if active is not None:
+                return active
+            frame = frame.f_back
         return None
 
-    def create_stack_snapshot(
+    def _nearest_owner_step(
         self,
-        call_id: int,
+        frame: types.FrameType | None,
+    ) -> ExecutionStep | None:
+        """Find the closest active timeline step in the actual frame stack."""
+
+        while frame is not None:
+            active = self._active_calls_by_frame.get(id(frame))
+            if active is not None and active.current_step is not None:
+                return active.current_step
+            frame = frame.f_back
+        return None
+
+    def _ensure_top_active(self, active: _ActiveCall) -> None:
+        if not self._active_calls or self._active_calls[-1] is not active:
+            raise MonitoringStateError(
+                f"Out-of-order return/unwind for {active.code.co_qualname}"
+            )
+
+    def _remove_active(self, active: _ActiveCall) -> None:
+        self._active_calls.pop()
+        self._active_calls_by_frame.pop(active.frame_id, None)
+
+    def _merge_call_attributes(
+        self,
+        call: FunctionCall,
+        attributes: Mapping[str, Any] | None,
+        error_kind: str,
+        capture_error: str | None,
+    ) -> None:
+        merged = dict(call.attributes)
+        if attributes:
+            merged.update(attributes)
+        if capture_error:
+            errors = dict(merged.get("capture_errors", {}))
+            errors[error_kind] = capture_error
+            merged["capture_errors"] = errors
+        call.attributes = merged
+
+    def _mark_event_recorded(self) -> None:
+        self._pending_events += 1
+        if (
+            self.flush_batch_size > 0
+            and self._pending_events >= self.flush_batch_size
+        ):
+            self.database.flush()
+            self._pending_events = 0
+
+    def _call_start_attributes(
+        self,
+        registration: CaptureRegistration,
+        frame: types.FrameType,
+        instruction_offset: int,
+    ) -> Mapping[str, Any] | None:
+        provider = registration.start_attributes
+        if provider is None:
+            return None
+        return self._safe_attributes(
+            "start_attributes",
+            lambda: provider(self, frame, registration.code, instruction_offset),
+        )
+
+    def _call_return_attributes(
+        self,
+        registration: CaptureRegistration | None,
+        frame: types.FrameType,
+        code: types.CodeType,
+        instruction_offset: int,
+        return_value: Any,
+    ) -> Mapping[str, Any] | None:
+        if registration is None or registration.return_attributes is None:
+            return None
+        provider = registration.return_attributes
+        return self._safe_attributes(
+            "return_attributes",
+            lambda: provider(
+                self,
+                frame,
+                code,
+                instruction_offset,
+                return_value,
+            ),
+        )
+
+    def _call_line_attributes(
+        self,
+        registration: CaptureRegistration,
+        frame: types.FrameType,
         line_number: int,
-        locals_dict: dict[str, str],
-        globals_dict: dict[str, str],
-        order_in_call: int | None = None,
-        code_definition_id: str | None = None,
-        previous_snapshot_id: int | None = None,
-        edge_type: str = "execution",
-    ) -> StackSnapshot | None:
-        """
-        Create a stack snapshot for a function call.
-
-        Args:
-            call_id: The ID of the function call
-            line_number: The line number where the snapshot was taken
-            locals_dict: Dictionary of local variable references
-            globals_dict: Dictionary of global variable references
-            order_in_call: Position in the execution sequence (optional)
-            code_definition_id: Exact code definition for this state. Defaults to the call code.
-            previous_snapshot_id: Snapshot this state was derived from, if not the previous order.
-            edge_type: Trace graph edge type connecting the previous snapshot.
-
-        Returns:
-            The created StackSnapshot object or None if creation fails
-        """
-        if self.call_tracker is None:
+    ) -> Mapping[str, Any] | None:
+        provider = registration.line_attributes
+        if provider is None:
             return None
+        return self._safe_attributes(
+            "line_attributes",
+            lambda: provider(self, frame, registration.code, line_number),
+        )
 
+    def _safe_attributes(
+        self,
+        provider_name: str,
+        invoke: Callable[[], Mapping[str, Any] | None],
+    ) -> Mapping[str, Any] | None:
         try:
-            # Get the function call
-            call = self.session.get(FunctionCall, call_id)
-            if not call:
-                logger.error(f"Function call {call_id} not found during stack snapshot creation")
-                return None
-
-            if code_definition_id is None:
-                code_definition_id = call.code_definition_id
-
-            # Find the previous snapshot if any
-            prev_snapshot = None
-            if previous_snapshot_id is not None:
-                prev_snapshot = self.session.get(StackSnapshot, previous_snapshot_id)
-                if prev_snapshot is None:
-                    logger.error(f"Previous stack snapshot {previous_snapshot_id} not found")
-                    return None
-            elif order_in_call is not None and order_in_call > 0:
-                prev_snapshot = self.session.query(StackSnapshot).filter(
-                    StackSnapshot.function_call_id == call_id,
-                    StackSnapshot.order_in_call == order_in_call - 1
-                ).first()
-
-            # Create the new snapshot
-            snapshot = StackSnapshot(
-                function_call_id=call_id,
-                code_definition_id=code_definition_id,
-                line_number=line_number,
-                locals_refs=locals_dict,
-                globals_refs=globals_dict,
-                order_in_call=order_in_call
-            )
-
-            self.session.add(snapshot)
-            self.session.flush()  # Flush to get the ID
-
-            # Record graph edge and maintain the legacy linear next pointer.
-            if prev_snapshot:
-                edge = StackSnapshotEdge(
-                    from_snapshot_id=prev_snapshot.id,
-                    to_snapshot_id=snapshot.id,
-                    edge_type=edge_type,
-                )
-                self.session.add(edge)
-                if edge_type == "execution" and prev_snapshot.next_snapshot_id is None:
-                    prev_snapshot.next_snapshot_id = snapshot.id
-
-            # If this is the first snapshot for this call, update the call record
-            if order_in_call == 0 or not call.first_snapshot_id:
-                call.first_snapshot_id = snapshot.id
-
-            return snapshot
-        except Exception as e:
-            logger.error(f"Error creating stack snapshot for call {call_id}: {e}")
-            logger.error(traceback.format_exc())
-            return None
-
-    def monitor_callback_function_start(self, code: types.CodeType, offset):
-        # Check if recording is enabled
-        logger.info(f"Monitoring function start: {code.co_name}")
-        if not self.is_recording_enabled:
-            return
-        if self.call_tracker is None:
-            return
-        if self.performance:
-            t1 = perf_counter()
-
-        current_frame = inspect.currentframe()
-        if current_frame is None or current_frame.f_back is None:
-            return
-
-        frame = current_frame.f_back
-        func_name = code.co_name
-        func_obj = frame.f_globals.get(func_name)
-
-        # Check if this is a tracked function and if so,
-        # verify that its tracking function is in our call stack
-        is_tracked_function = False
-        tracking_function_name = None
-
-        # Check direct attribute on function object
-        if func_obj and func_name in SpaceTimeMonitor._tracked_functions:
-            tracking_function_name = SpaceTimeMonitor._tracked_functions[func_name]["parent_tracking_function"]
-
-        # If we found tracking information, verify it's in our call stack
-        if tracking_function_name:
-            if not self.call_stack:
-                return
-
-            for call in self.call_stack:
-                if call.function == tracking_function_name:
-                    is_tracked_function = True
-                    break
-
-            if not is_tracked_function:
-                return
-
-
-        # Get the function's parameter names from its code object
-        arg_names = code.co_varnames[:code.co_argcount]
-
-        # Get the values of the arguments from the frame's locals
-        function_locals = {}
-        for arg_name in arg_names:
-            if arg_name in frame.f_locals:
-                function_locals[arg_name] = frame.f_locals[arg_name]
-        # Get used globals
-        globals_used = self.get_used_globals(code, frame.f_globals)
-        # Get ignored variables from the function object itself
-        ignored_variables = []
-        if func_obj and func_name in SpaceTimeMonitor._monitored_functions:
-            ignored_variables = SpaceTimeMonitor._monitored_functions[func_name]["ignore"] or [] # Ensure it's a list
-
-        # Get hooks from the function object
-        start_hooks = []
-        if func_obj:
-            # Safely get start_hooks, handling case where function isn't registered
-            if func_name in SpaceTimeMonitor._monitored_functions:
-                start_hooks = SpaceTimeMonitor._monitored_functions[func_name]["start_hooks"] or []
-            else:
-                # Function not explicitly registered for monitoring, use empty hooks
-                logger.debug(f"Function '{func_name}' not found in _monitored_functions, using empty start_hooks")
-                start_hooks = []
-
-        # Filter locals and globals based on the ignore list
-        function_locals = {k: v for k, v in function_locals.items() if k not in ignored_variables}
-        globals_used = {k: v for k, v in globals_used.items() if k not in ignored_variables}
-
-        # Get cached code definition (performance optimization)
-        code_def_id = self._get_cached_code_definition(func_obj, code.co_name) if func_obj else None
-
-        # Execute start hooks and collect initial metadata
-        start_metadata = {}
-
-        for hook in start_hooks:
-            try:
-                hook_metadata = hook(self, code, offset)
-                if isinstance(hook_metadata, dict):
-                    start_metadata.update(hook_metadata)
-                else:
-                    logger.warning(f"Start hook {hook.__name__} for {code.co_name} did not return a dict.")
-            except Exception as hook_exc:
-                logger.error(f"Error executing start hook {hook.__name__} for {code.co_name}: {hook_exc}")
-                logger.error(traceback.format_exc())
-
-        # Get the actual file and line number from the code object
-        file_name = code.co_filename
-        line_number = code.co_firstlineno
-
-        # Get function qualname for better tracking
-        function_qualname = code.co_name
-        try:
-            if 'self' in frame.f_locals and hasattr(frame.f_locals['self'], '__class__'):
-                function_qualname = f"{frame.f_locals['self'].__class__.__name__}.{code.co_name}"
-        except Exception:
-            pass  # Use simple name if extraction fails
-
-
-        # Create the function call directly (inlined capture_call)
-        try:
-            # Store local and global variables
-            locals_refs = self._store_variables(function_locals)
-            globals_refs = self._store_variables(globals_used)
-
-            # Check if a parent ID was set for replay
-            parent_id = self._parent_id_for_next_call
-            if parent_id is not None:
-                # Reset the flag immediately after reading it
-                self._parent_id_for_next_call = None
-                logger.info(f"Replay detected: Setting parent_call_id to {parent_id} for next call.")
-
-            # If we're inside another monitored function (stack isn't empty), get the parent ID
-            if not parent_id and len(self.call_stack) > 0:
-                parent_id = self.call_stack[-1].id
-
-            # Calculate order in session using in-memory counter (performance optimization)
-            order_in_session = None
-            if self.current_session is not None:
-                order_in_session = self._current_session_call_count
-
-            # Calculate order within parent function using in-memory counter (performance optimization)
-            order_in_parent = None
-            if parent_id is not None:
-                order_in_parent = self._parent_call_child_counts.get(parent_id, 0)
-
-            # Get the current session ID from the monitor instance, if available
-            current_session_id = None
-            if self.current_session:
-                current_session_id = self.current_session.id
-
-            # Create function call record directly
-            call = FunctionCall(
-                function=function_qualname,
-                file=file_name,
-                line=line_number,
-                start_time=datetime.datetime.now(),
-                locals_refs=locals_refs,
-                globals_refs=globals_refs,
-                code_definition_id=code_def_id,
-                call_metadata=start_metadata,
-                parent_call_id=parent_id,
-                session_id=current_session_id,
-                order_in_session=order_in_session,
-                order_in_parent=order_in_parent
-            )
-
-            self.session.add(call)
-            self.session.flush()  # Flush to get the ID
-            if call.id is None:
-                logger.error(f"Failed to obtain ID for new FunctionCall for {function_qualname}")
-                self.session.rollback()
-                return
-
-            # Add the FunctionCall object to the stack instead of just the ID
-            self.call_stack.append(call)
-
-            # Track the first call in the session as the entry point
-            if self._current_session_first_call_id is None:
-                self._current_session_first_call_id = call.id
-                logger.debug(f"Set first call ID for session to {call.id}")
-
-            # Update the last call ID to the current one
-            self._current_session_last_call_id = call.id
-
-            # If we have an active session, add this function call to it
-            if self.current_session is not None and call.id is not None:
-                self.add_function_call_to_session(function_qualname, call.id)
-
-            # Increment counters after successful call creation (performance optimization)
-            if self.current_session is not None:
-                self._current_session_call_count += 1
-
-            if parent_id is not None:
-                self._parent_call_child_counts[parent_id] = self._parent_call_child_counts.get(parent_id, 0) + 1
-
-            # Initialize snapshot counter for this function call
-            self._function_snapshot_counts[call.id] = 0
-
-        except Exception as e:
-            logger.error(f"Error capturing function call: {e}")
-            logger.error(traceback.format_exc())
-            self.session.rollback()
-
-        if self.performance:
-            t2 = perf_counter()
-            elapsed = t2 - t1
-            self.performance_data["function_starts"].append((func_name, elapsed))
-
-
-    def monitor_callback_function_return(self, code: types.CodeType, offset, return_value):
-        # Check if recording is enabled
-        logger.info(f"Monitoring function return: {code.co_name}")
-        if not self.is_recording_enabled:
-            return
-
-        if self.call_tracker is None or not self.call_stack:
-            return
-
-        if self.performance:
-            t1 = perf_counter()
-
-        collected_return_metadata = {}
-        try:
-            # Get the FunctionCall object for this function
-            call = self.call_stack.pop()
-
-            # Get the function object from the frame
-            frame = inspect.currentframe()
-            if frame is None or frame.f_back is None:
-                return
-            func_obj = frame.f_back.f_globals.get(code.co_name)
-            return_hooks = []
-            if func_obj:
-                # Safely get return_hooks, handling case where function isn't registered
-                if code.co_name in SpaceTimeMonitor._monitored_functions:
-                    return_hooks = SpaceTimeMonitor._monitored_functions[code.co_name]["return_hooks"] or []
-                else:
-                    # Function not explicitly registered for monitoring, use empty hooks
-                    logger.debug(f"Function '{code.co_name}' not found in _monitored_functions, using empty return_hooks")
-                    return_hooks = []
-
-            # Execute return hooks if any
-            for hook in return_hooks:
-                try:
-                    # Pass monitor instance, code object, offset, and return value
-                    hook_metadata = hook(self, code, offset, return_value)
-                    if isinstance(hook_metadata, dict):
-                        # Merge hook metadata, preferring hook's values on conflict
-                        collected_return_metadata.update(hook_metadata)
-                    else:
-                        logger.warning(f"Return hook {hook.__name__} for {code.co_name} did not return a dict.")
-                except Exception as hook_exc:
-                    logger.error(f"Error executing return hook {hook.__name__} for {code.co_name}: {hook_exc}")
-                    logger.error(traceback.format_exc())
-
-            # Inline capture_return functionality - store return value and update call
-            try:
-                return_ref = self.call_tracker.object_manager.store(return_value)
-                call.return_ref = return_ref
-                call.end_time = datetime.datetime.now()
-
-                # Update metadata with hook results (if any)
-                if collected_return_metadata:
-                    # If there's existing metadata, merge it with the new data
-                    if call.call_metadata:
-                        # Create a new dict to avoid modifying the original
-                        updated_metadata = dict(call.call_metadata)
-                        updated_metadata.update(collected_return_metadata)
-                        call.call_metadata = updated_metadata
-                    else:
-                        call.call_metadata = collected_return_metadata
-
-                # Clean up snapshot counter (performance optimization)
-                if call.id in self._function_snapshot_counts:
-                    del self._function_snapshot_counts[call.id]
-
-                # Commit the changes
-                self.session.commit()
-
-            except Exception as e:
-                logger.warning(f"Could not store return value: {e}")
-                self.session.rollback()
-
-        except Exception as e:
-            logger.error(f"Error capturing function return: {e}")
-            logger.error(traceback.format_exc())
-            self.session.rollback()
-
-        if self.performance:
-            t2 = perf_counter()
-            elapsed = t2 - t1
-            self.performance_data["function_returns"].append((code.co_name, elapsed))
-
-    def _get_accessed_global_names(self, code: types.CodeType, processed_functions=None):
-        """Extract global names accessed by bytecode (static analysis, cached)"""
-        if code in self._bytecode_cache:
-            return self._bytecode_cache[code]
-
-        if processed_functions is None:
-            processed_functions = set()
-
-        accessed_names = set()
-
-        # Scan bytecode for LOAD_GLOBAL operations
-        for instr in dis.get_instructions(code):
-            if instr.opname == "LOAD_GLOBAL":
-                name = instr.argval
-                # Skip special dunder methods
-                if (name.startswith('__') and name.endswith('__')):
-                    continue
-                # Skip built-in variables
-                if name in sys.builtin_module_names:
-                    continue
-                # Skip if it's a default function(like print, len, etc)
-                if name in __builtins__:
-                    continue
-
-                accessed_names.add(name)
-
-        # Cache the result (this never changes for a given code object)
-        self._bytecode_cache[code] = accessed_names
-        return accessed_names
-
-    def _get_object_type_info(self, obj):
-        """Get cached type information for an object"""
-        obj_id = id(obj)
-
-        # Check if we already have type info for this object
-        if obj_id in self._type_cache:
-            return self._type_cache[obj_id]
-
-        # Prevent memory leaks by limiting cache size
-        if len(self._type_cache) >= self._type_cache_max_size:
-            # Clear half the cache (simple LRU approximation)
-            items_to_remove = len(self._type_cache) // 2
-            for _ in range(items_to_remove):
-                self._type_cache.popitem()
-
-        # Determine type info once and cache it
-        type_info = {
-            'is_module': isinstance(obj, types.ModuleType),
-            'is_function': isinstance(obj, types.FunctionType),
-            'should_include': True  # Default to include unless explicitly excluded
-        }
-
-        # If it's a module, don't include it
-        if type_info['is_module']:
-            type_info['should_include'] = False
-
-        self._type_cache[obj_id] = type_info
-        return type_info
-
-    def get_used_globals(self, code: types.CodeType, globals: dict, processed_functions=None):
-        """Analyze function bytecode to find accessed global variables (optimized version)
-
-        Args:
-            code: The code object to analyze
-            globals: The globals dictionary
-            processed_functions: Set of function names already processed to avoid infinite recursion
-
-        Returns:
-            Dictionary of global variables used by the function and its called functions
-        """
-        if processed_functions is None:
-            processed_functions = set()
-
-        # Step 1: Get the static list of accessed global names (cached)
-        accessed_names = self._get_accessed_global_names(code, processed_functions)
-
-        # Step 2: For each accessed name, get its current value with type caching
-        globals_used = {}
-
-        for name in accessed_names:
-            if name not in globals:
-                continue
-
-            value = globals[name]
-            type_info = self._get_object_type_info(value)
-
-            # Skip modules
-            if type_info['is_module']:
-                continue
-
-            # Handle functions recursively
-            if type_info['is_function']:
-                # Store the function itself if needed
-                # globals_used[name] = value
-
-                # Recursively process function if not already processed
-                if name not in processed_functions:
-                    processed_functions.add(name)
-                    try:
-                        func_code = value.__code__
-                        func_globals = value.__globals__
-                        nested_globals = self.get_used_globals(func_code, func_globals, processed_functions)
-                        globals_used.update(nested_globals)
-                    except AttributeError:
-                        # Handle edge cases where function doesn't have __code__ or __globals__
-                        pass
-                continue
-
-            # Include regular variables
-            if type_info['should_include']:
-                globals_used[name] = value
-
-        return globals_used
-
-    def monitor_callback_line(self, code: types.CodeType, line_number):
-        """Callback function for line events"""
-        # Check if recording is enabled
-        logger.info(f"Monitoring line: {code.co_name} at line {line_number}")
-        if not self.is_recording_enabled:
-            return
-
-        if self.call_tracker is None:
-            return
-
-        if self.performance:
-            t1 = perf_counter()
-
-        current_frame = inspect.currentframe()
-        if current_frame is None or current_frame.f_back is None:
-            return
-
-        if (
-            code.co_name in SpaceTimeMonitor._monitored_functions and
-            "lines" in SpaceTimeMonitor._monitored_functions[code.co_name] and
-            SpaceTimeMonitor._monitored_functions[code.co_name]["lines"] is not None and
-            line_number not in SpaceTimeMonitor._monitored_functions[code.co_name]["lines"]
-        ):
-            return
-
-        if (
-            code.co_name in SpaceTimeMonitor._monitored_functions and
-            "use_tag_line" in SpaceTimeMonitor._monitored_functions[code.co_name] and
-            SpaceTimeMonitor._monitored_functions[code.co_name]["use_tag_line"] and
-            "#tag" not in linecache.getline(code.co_filename, line_number)
-        ):
-            return
-
-        # The parent frame should be the actual function being executed
-        frame = current_frame.f_back
-
-        try:
-            # Get the current function call from the stack
-            if not self.call_stack:
-                return
-            current_call = self.call_stack[-1]
-            logger.info(f"Current Skip one line snapshot flags: {self.skip_one_line_snapshot} with current name {code.co_name}")
-            if code.co_name in self.skip_one_line_snapshot:
-                self.skip_one_line_snapshot.remove(code.co_name)
-                logger.info(f"Skipping stack snapshot for line {line_number} in function {code.co_name} due to skip flag")
-                return
-
-            code_def_id = self._get_code_definition_for_frame(frame, code)
-
-            # Get function's locals and globals
-            function_locals = {}
-            globals_used = {}
-
-            # Capture locals
-            for name, value in frame.f_locals.items():
-                try:
-                    # Skip special variables and functions
-                    if name.startswith('__') or callable(value):
-                        continue
-                    ref = self.call_tracker.object_manager.store(value)
-                    function_locals[name] = ref
-                    if self.performance:
-                        self.performance_data["line_captured_locals"] += 1
-                except Exception as e:
-                    if self.performance:
-                        self.performance_data["line_failed_serialization"] += 1
-                        self.performance_data["line_failed_type"].add(type(value))
-                    #logger.warning(f"Failed to store local variable {name}: {e}")
-
-            # Capture used globals
-            for name, value in self.get_used_globals(code, frame.f_globals).items():
-                try:
-                    ref = self.call_tracker.object_manager.store(value)
-                    globals_used[name] = ref
-                except Exception as e:
-                    if self.performance:
-                        self.performance_data["line_failed_serialization"] += 1
-                        self.performance_data["line_failed_type"].add(type(value))
-                    #logger.warning(f"Failed to store global variable {name}: {e}")
-
-            # Create a new stack snapshot
-            try:
-                # Get the current snapshot count using in-memory counter (performance optimization)
-                snapshots_count = self._function_snapshot_counts.get(current_call.id, 0)
-
-                self.create_stack_snapshot(
-                    current_call.id,
-                    line_number,
-                    function_locals,
-                    globals_used,
-                    order_in_call=snapshots_count,
-                    code_definition_id=code_def_id,
-                )
-
-                # Increment the snapshot counter for this function call
-                self._function_snapshot_counts[current_call.id] = snapshots_count + 1
-
-                # Log for debugging
-                logger.debug(f"Created stack snapshot for line {line_number} in function {code.co_name}")
-
-                # Commit to ensure the snapshot is saved
-                self.session.commit()
-
-            except Exception as e:
-                logger.error(f"Error creating stack snapshot: {e}")
-                logger.error(traceback.format_exc())
-                self.session.rollback()
-
-        except Exception as e:
-            logger.error(f"Error in line monitoring callback: {e}")
-            logger.error(traceback.format_exc())
-
-        if self.performance:
-            t2 = perf_counter()
-            elapsed = t2 - t1
-            self.performance_data["line_events"].append((code.co_name, elapsed))
-
-def pymonitor(mode="function", ignore=None, start_hooks=None, return_hooks=None, track=None, lines=None, use_tag_line=False):
-    """
-    Unified decorator for monitoring Python function execution.
-
-    Args:
-        mode (str): Monitoring mode - "function" or "line". Defaults to "function".
-            - "function": Records only function entry and exit
-            - "line": Records state at each line of execution
-        ignore (list[str], optional): Variable names to ignore during monitoring. Defaults to None.
-        start_hooks (list[callable], optional): Functions called at function start to generate metadata.
-            Each function should accept (monitor, code, offset) and return a dictionary. Defaults to None.
-        return_hooks (list[callable], optional): Functions called at function return to generate metadata.
-            Each function should accept (monitor, code, offset, return_value) and return a dictionary. Defaults to None.
-        track (list[callable], optional): Additional functions to track only when they are called within
-            this monitored function context. These functions won't be tracked when called directly
-            outside a monitored context. Defaults to None.
-        lines (list[int], optional): Specific line numbers to monitor within the function if mode is "line". Defaults to None (monitor all lines).
-        use_tag_line (bool, optional): If True and mode is "line", only monitor lines containing the comment "#tag". Defaults to False.
-
-    Returns:
-        The decorated function with monitoring enabled
-
-    Example:
-        @pymonitor(mode="line", ignore=["large_data"], track=[helper_function])
-        def my_function(x, y):
-            result = helper_function(x)  # helper_function will be tracked here
-            return result
-
-        helper_function(10)  # Not tracked when called directly
-    """
-    # Initialize default parameter values
-    if ignore is None:
-        ignore = []
-    if start_hooks is None:
-        start_hooks = []
-    if return_hooks is None:
-        return_hooks = []
-    if track is None:
-        track = []
-
-    # Validate mode parameter
-    if mode not in ["function", "line"]:
-        raise ValueError(f"Invalid monitoring mode: {mode}. Must be 'function' or 'line'")
-
-    def _decorator(func):
-        # Add logging to see which function is being decorated
-        logger.info(f"Applying pymonitor decorator to function: {func.__name__}")
-
-        # Ensure monitoring tool is initialized
-        if sys.monitoring.get_tool(MONITOR_TOOL_ID) is None:
-            sys.monitoring.use_tool_id(MONITOR_TOOL_ID, "py_monitoring")
-
-        # Set events based on mode
-        if mode == "line":
-            events = (sys.monitoring.events.LINE |
-                     sys.monitoring.events.PY_START |
-                     sys.monitoring.events.PY_RETURN)
-        else:  # mode == "function"
-            events = sys.monitoring.events.PY_START | sys.monitoring.events.PY_RETURN
-
-        # Enable monitoring for this function
-        sys.monitoring.set_local_events(MONITOR_TOOL_ID, func.__code__, events)
-
-        # Store metadata on the function object
-        SpaceTimeMonitor._monitored_functions[func.__name__] = {
-            "ignore": ignore,
-            "start_hooks": start_hooks,
-            "return_hooks": return_hooks,
-            "tracked_functions": track,
-            "lines": lines,  # Specific lines to monitor if in line mode
-            "use_tag_line": use_tag_line  # Whether to only monitor lines with #tag
-        }
-
-        # Also enable monitoring for tracked functions
-        for tracked_func in track:
-            if callable(tracked_func):
-                # Mark the tracked function with the parent that's tracking it
-
-                SpaceTimeMonitor._tracked_functions[tracked_func.__name__] = {
-                    "parent_tracking_function": func.__name__
+            attributes = invoke()
+        except BaseException as error:  # interface hook must not alter execution
+            return {
+                "capture_errors": {
+                    provider_name: f"{type(error).__name__}: {error}"
                 }
+            }
+        if attributes is None:
+            return None
+        if not isinstance(attributes, Mapping):
+            return {
+                "capture_errors": {
+                    provider_name: "attribute provider did not return a mapping"
+                }
+            }
+        return attributes
 
-                if tracked_func.__name__ not in SpaceTimeMonitor._monitored_functions:
-                    SpaceTimeMonitor._monitored_functions[tracked_func.__name__] = {
-                        "ignore": [],
-                        "start_hooks": [],
-                        "return_hooks": [],
-                        "tracked_functions": []
-                    }
-                logger.info(f"Enabling monitoring for tracked function: {tracked_func.__name__} (tracked by {func.__name__})")
+    def _handle_callback_error(self, error: BaseException) -> None:
+        self.last_callback_error = error
+        self.is_recording_enabled = False
+        logger.exception("SpaceTimePy monitoring callback failed")
+        if not self.database.is_active:
+            self.database.rollback()
+            self._pending_events = 0
+            self._active_calls.clear()
+            self._active_calls_by_frame.clear()
 
-                # Use function mode for tracked functions to avoid overhead
-                tracked_events = sys.monitoring.events.PY_START | sys.monitoring.events.PY_RETURN
-                if not hasattr(tracked_func, '__code__'):
-                    logger.warning(f"Tracked function {tracked_func.__name__} has no __code__ attribute, skipping monitoring")
-                    continue
-                sys.monitoring.set_local_events(MONITOR_TOOL_ID, tracked_func.__code__, tracked_events)
+    @staticmethod
+    def _code_from_target(
+        target: types.CodeType | Callable[..., Any],
+    ) -> types.CodeType:
+        if isinstance(target, types.CodeType):
+            return target
+        code = getattr(target, "__code__", None)
+        if code is None and hasattr(target, "__func__"):
+            code = getattr(target.__func__, "__code__", None)
+        if not isinstance(code, types.CodeType):
+            raise TypeError("Capture target must be a Python callable or code object")
+        return code
 
-        return func
+    def _capture_mapping(
+        self,
+        values: Mapping[str, Any],
+        ignored_names: Collection[str],
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        references: dict[str, str] = {}
+        errors: dict[str, str] = {}
 
-    # Handle usage as a direct decorator (no arguments)
-    if callable(mode) and not isinstance(mode, str):
-        func = mode
-        mode = "function"  # Default to function mode
-        return _decorator(func)
+        for name, value in values.items():
+            if (
+                name in ignored_names
+                or name.startswith("__")
+                or callable(value)
+                or isinstance(value, types.ModuleType)
+            ):
+                continue
+            try:
+                references[name] = self._store_value(value)
+            except Exception as error:  # noqa: BLE001 - record other variables
+                errors[name] = f"{type(error).__name__}: {error}"
 
-    return _decorator
+        return references, errors
+
+    def _store_value(self, value: Any) -> str:
+        type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+        is_primitive = isinstance(value, int | float | bool | str | type(None))
+
+        if is_primitive:
+            canonical = json.dumps(
+                {"type": type_name, "value": value},
+                allow_nan=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            state_digest = hashlib.sha256(canonical).hexdigest()
+            identity_hash = f"primitive:{state_digest}"
+            object_reference = state_digest
+            pickle_data = None
+            primitive_value = value
+        else:
+            pickle_data = self.serializer.dumps(value)
+            state_digest = hashlib.sha256(pickle_data).hexdigest()
+            identity_hash = f"runtime:{self._identity_namespace}:{id(value)}"
+            object_reference = hashlib.sha256(
+                f"{identity_hash}:{state_digest}".encode()
+            ).hexdigest()
+            primitive_value = None
+
+        cache_key = (identity_hash, state_digest)
+        cached_reference = self._stored_value_cache.get(cache_key)
+        if cached_reference is not None:
+            return cached_reference
+
+        # Runtime identities include this monitor's namespace, so only stable
+        # primitive references can already exist from an earlier recording.
+        if is_primitive:
+            with self.database.no_autoflush:
+                existing = self.database.get(StoredObject, object_reference)
+            if existing is not None:
+                self._stored_value_cache[cache_key] = existing.id
+                return existing.id
+
+        identity = self._identity_cache.get(identity_hash)
+        if identity is None:
+            identity = ObjectIdentity(identity_hash=identity_hash, name=type_name)
+            self.database.add(identity)
+        self._identity_cache[identity_hash] = identity
+
+        version_number = self._next_object_versions.get(identity_hash, 1)
+        self._next_object_versions[identity_hash] = version_number + 1
+        stored = StoredObject(
+            id=object_reference,
+            identity=identity,
+            version_number=version_number,
+            type_name=type_name,
+            is_primitive=is_primitive,
+            primitive_value=primitive_value,
+            pickle_data=pickle_data,
+        )
+        self.database.add(stored)
+        self._stored_value_cache[cache_key] = object_reference
+        return object_reference
+
+    def _store_code_definition(self, code: types.CodeType) -> str | None:
+        if code in self._code_definition_cache:
+            return self._code_definition_cache[code]
+
+        try:
+            code_content = inspect.getsource(code)
+            first_line_number = inspect.getsourcelines(code)[1]
+        except (OSError, TypeError):
+            self._code_definition_cache[code] = None
+            return None
+
+        definition_id = hashlib.sha256(code_content.encode()).hexdigest()
+        if definition_id not in self._known_code_definition_ids:
+            with self.database.no_autoflush:
+                definition = self.database.get(CodeDefinition, definition_id)
+            if definition is None:
+                definition = CodeDefinition(
+                    id=definition_id,
+                    name=code.co_name,
+                    qualified_name=code.co_qualname,
+                    kind="function",
+                    module_path=code.co_filename,
+                    code_content=code_content,
+                    first_line_number=first_line_number,
+                )
+                self.database.add(definition)
+            self._known_code_definition_ids.add(definition_id)
+
+        self._code_definition_cache[code] = definition_id
+        return definition_id
+
+    def _used_globals(
+        self,
+        code: types.CodeType,
+        global_namespace: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        names = self._global_names_for_code(code)
+
+        return {
+            name: global_namespace[name]
+            for name in names
+            if name in global_namespace
+        }
+
+    def _global_names_for_code(self, code: types.CodeType) -> frozenset[str]:
+        names = self._global_names_cache.get(code)
+        if names is None:
+            names = frozenset(
+                instruction.argval
+                for instruction in dis.get_instructions(code)
+                if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
+                and isinstance(instruction.argval, str)
+            )
+            self._global_names_cache[code] = names
+        return names
+
+    def _require_session(self) -> ExecutionSession:
+        if self.current_session is None:
+            raise MonitoringStateError("No execution session is currently being recorded")
+        return self.current_session
+
+    def _require_branch(self) -> ExecutionBranch:
+        if self.current_branch is None:
+            raise MonitoringStateError("No execution branch is currently being recorded")
+        return self.current_branch
+
+    @staticmethod
+    def _now() -> datetime.datetime:
+        return datetime.datetime.now(datetime.UTC)
 
 
-def function(ignore=None, start_hooks=None, return_hooks=None, track=None):
-    """
-    Decorator for monitoring function execution at function level.
-    
-    This is a convenience decorator that calls pymonitor with mode="function".
-    It records function entry and exit, capturing arguments, return values, and state.
-    
-    Args:
-        ignore (list[str], optional): Variable names to ignore during monitoring. Defaults to None.
-        start_hooks (list[callable], optional): Functions called at function start to generate metadata.
-            Each function should accept (monitor, code, offset) and return a dictionary. Defaults to None.
-        return_hooks (list[callable], optional): Functions called at function return to generate metadata.
-            Each function should accept (monitor, code, offset, return_value) and return a dictionary. Defaults to None.
-        track (list[callable], optional): Additional functions to track only when they are called within
-            this monitored function context. Defaults to None.
-    
-    Returns:
-        The decorated function with function-level monitoring enabled
-    
-    Example:
-        @spacetimepy.function
-        def calculate_sum(x, y):
-            return x + y
-        
-        @spacetimepy.function(ignore=["temp_data"], track=[helper])
-        def process_data(data):
-            result = helper(data)
-            return result
-    """
-    return pymonitor(mode="function", ignore=ignore, start_hooks=start_hooks, 
-                     return_hooks=return_hooks, track=track)
-
-
-def line(ignore=None, start_hooks=None, return_hooks=None, track=None, lines=None, use_tag_line=False):
-    """
-    Decorator for monitoring function execution at line level.
-    
-    This is a convenience decorator that calls pymonitor with mode="line".
-    It records state at each line of execution, providing detailed execution traces.
-    
-    Args:
-        ignore (list[str], optional): Variable names to ignore during monitoring. Defaults to None.
-        start_hooks (list[callable], optional): Functions called at function start to generate metadata.
-            Each function should accept (monitor, code, offset) and return a dictionary. Defaults to None.
-        return_hooks (list[callable], optional): Functions called at function return to generate metadata.
-            Each function should accept (monitor, code, offset, return_value) and return a dictionary. Defaults to None.
-        track (list[callable], optional): Additional functions to track only when they are called within
-            this monitored function context. Defaults to None.
-        lines (list[int], optional): Specific line numbers to monitor within the function. Defaults to None (monitor all lines).
-        use_tag_line (bool, optional): If True, only monitor lines containing the comment "#tag". Defaults to False.
-    
-    Returns:
-        The decorated function with line-level monitoring enabled
-    
-    Example:
-        @spacetimepy.line
-        def process_items(items):
-            for item in items:
-                result = item * 2
-            return result
-        
-        @spacetimepy.line(lines=[10, 15, 20])
-        def complex_function():
-            # Only lines 10, 15, and 20 will be monitored
-            pass
-    """
-    return pymonitor(mode="line", ignore=ignore, start_hooks=start_hooks, 
-                     return_hooks=return_hooks, track=track, lines=lines, use_tag_line=use_tag_line)
-
-
-def init_monitoring(*args, **kwargs):
-    """
-    Initialize the monitoring system.
-
-    Args:
-        db_path (str, optional): Path to the database file. Defaults to "monitoring.db".
-        queue_size (int, optional): Size of the monitoring queue. Defaults to 1000.
-        flush_interval (float, optional): Interval for flushing the queue. Defaults to 1.0.
-        pickle_config (PickleConfig, optional): Custom pickle configuration for serializing objects.
-            This can include custom reducers for specific types. Defaults to None.
-        custom_picklers (list, optional): List of module names to load custom picklers from.
-            These will be loaded from the spacetimepy/picklers directory. Defaults to None.
-
-    Returns:
-        SpaceTimeMonitor: The monitoring instance
-    """
-    # Add debug logging
-    logger.info("Initializing SpaceTimeMonitor system")
-
-    # If custom_picklers is specified but pickle_config is not,
-    # create a new pickle_config with the custom picklers
-    if 'custom_picklers' in kwargs and 'pickle_config' not in kwargs:
-        kwargs['pickle_config'] = PickleConfig(custom_picklers=kwargs.pop('custom_picklers'))
-    # If both are specified, update the existing pickle_config
-    elif 'custom_picklers' in kwargs and 'pickle_config' in kwargs:
-        custom_picklers = kwargs.pop('custom_picklers')
-        kwargs['pickle_config'].load_custom_picklers(custom_picklers)
-
-
-    return SpaceTimeMonitor(*args, **kwargs)
-
-
-
-def _cleanup_monitoring():
-    if SpaceTimeMonitor._instance is not None:
-        SpaceTimeMonitor._instance.shutdown()
-
-atexit.register(_cleanup_monitoring)
+__all__ = [
+    "CallRole",
+    "CaptureRegistration",
+    "MonitoringStateError",
+    "SpaceTimeMonitor",
+]
