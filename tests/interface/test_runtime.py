@@ -69,6 +69,33 @@ class TestSpaceTimeRuntime(SpaceTimeTestCase):
                 self.assertEqual(session.name, "persisted")
                 self.assertEqual(branch.steps[0].function_call.function_name, "calculate")
 
+    def test_reopened_session_lists_a_new_replay_branch(self) -> None:
+        self.space.close()
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "trace.db"
+            with SpaceTime.open(database_path) as writer:
+                @writer.capture.function
+                def calculate(value: int) -> int:
+                    return value + 1
+
+                with writer.capture.recording() as recording:
+                    calculate(3)
+                source = writer.data.get_branch(recording.branch_id).steps[0]
+
+            with SpaceTime.open(database_path, create_schema=False) as reader:
+                reader.capture.function(calculate)
+                result = reader.replay.run(
+                    lambda context: calculate(context.locals["value"]),
+                    parent_branch_id=recording.branch_id,
+                    forked_from_step_id=source.id,
+                )
+
+                session = reader.data.get_session(recording.session_id)
+                self.assertEqual(
+                    [branch.id for branch in session.branches],
+                    [recording.branch_id, result.branch.id],
+                )
+
     def test_runtime_context_rolls_back_uncommitted_recording_on_error(self) -> None:
         self.space.close()
         with tempfile.TemporaryDirectory() as directory:

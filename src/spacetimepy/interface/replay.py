@@ -146,6 +146,11 @@ class ExternalInteractionScript:
     ) -> set[str]:
         call = interaction.occurrence.call
         names = {call.function_name}
+        replay_target_names = call.attributes.get("replay_target_names", ())
+        if isinstance(replay_target_names, (list, tuple)):
+            names.update(
+                name for name in replay_target_names if isinstance(name, str)
+            )
         if call.qualified_name:
             names.add(call.qualified_name)
         if call.module_name:

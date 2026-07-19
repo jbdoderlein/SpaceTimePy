@@ -55,6 +55,31 @@ class TestReplayInterface(SpaceTimeTestCase):
         with self.assertRaisesRegex(ReplayDivergenceError, "exhausted"):
             context.external.take(read_external)
 
+    def test_external_script_accepts_the_original_name_of_a_replay_mock(self) -> None:
+        @self.space.capture.external(
+            start_hooks=(
+                lambda _context: {
+                    "replay_target_names": ["random.randint"],
+                },
+            )
+        )
+        def replacement() -> int:
+            return 7
+
+        @self.space.capture.function
+        def calculate() -> int:
+            return replacement()
+
+        with self.space.capture.recording() as recording:
+            calculate()
+        source = self.space.data.get_branch(recording.branch_id).steps[0]
+        context = self.space.replay.prepare(
+            parent_branch_id=recording.branch_id,
+            forked_from_step_id=source.id,
+        )
+
+        self.assertEqual(context.external.take("random.randint"), 7)
+
     def test_raised_external_interaction_is_reraised_by_script(self) -> None:
         @self.space.capture.external
         def unstable() -> None:

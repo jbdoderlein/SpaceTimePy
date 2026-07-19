@@ -7,6 +7,7 @@ future HTTP adapter without giving callers live SQLAlchemy objects.
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +26,6 @@ from spacetimepy.core.model import (
 from spacetimepy.core.serialization import PickleSerializer
 
 if TYPE_CHECKING:
-    import datetime
     from collections.abc import Collection
 
     from sqlalchemy.orm import Session
@@ -321,7 +321,10 @@ class TraceData:
     def _session_to_dto(self, session: ExecutionSession) -> SessionDTO:
         branches = sorted(
             session.branches,
-            key=lambda branch: (branch.created_at, branch.id or 0),
+            key=lambda branch: (
+                self._datetime_sort_key(branch.created_at),
+                branch.id or 0,
+            ),
         )
         roots = [branch for branch in branches if branch.parent_branch_id is None]
         root_id = self._id(roots[0], "execution branch") if len(roots) == 1 else None
@@ -337,6 +340,13 @@ class TraceData:
             root_branch_id=root_id,
             branches=tuple(self._branch_summary_to_dto(branch) for branch in branches),
         )
+
+    @staticmethod
+    def _datetime_sort_key(value: datetime.datetime) -> datetime.datetime:
+        """Normalize SQLite-loaded and newly-created timestamps for sorting."""
+        if value.tzinfo is not None:
+            value = value.astimezone(datetime.UTC).replace(tzinfo=None)
+        return value
 
     def _branch_summary_to_dto(self, branch: ExecutionBranch) -> BranchSummaryDTO:
         return BranchSummaryDTO(
