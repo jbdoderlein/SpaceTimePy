@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 import spacetimepy
-from spacetimepy import SpaceTime, open_spacetime
+from spacetimepy import SpaceTime, get_active_spacetime, open_spacetime
 from spacetimepy.core.model import Base
 from tests.support import SpaceTimeTestCase
 
@@ -17,6 +17,11 @@ class TestSpaceTimeRuntime(SpaceTimeTestCase):
         self.assertIs(self.space.capture._database, self.space.data._database)
         self.assertIs(self.space.replay._data, self.space.data)
         self.assertFalse(self.space.is_closed)
+        self.assertIs(get_active_spacetime(), self.space)
+
+    def test_closed_runtime_is_no_longer_active(self) -> None:
+        self.space.close()
+        self.assertIsNone(get_active_spacetime())
 
     def test_open_spacetime_is_the_public_factory(self) -> None:
         self.space.close()

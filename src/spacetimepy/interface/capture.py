@@ -748,6 +748,56 @@ class CaptureInterface:
         if self._standard_external_interactions is not None:
             self._standard_external_interactions.refresh()
 
+    def annotate_session(
+        self,
+        session_id: int,
+        attributes: Mapping[str, Any],
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Merge JSON metadata into an execution session."""
+
+        execution_session = self._database.get(ExecutionSession, session_id)
+        if execution_session is None:
+            raise LookupError(f"No execution session with id {session_id!r}")
+        selected = self._validated_attributes(attributes)
+        execution_session.attributes = {
+            **execution_session.attributes,
+            **selected,
+        }
+        self._database.flush()
+        if commit:
+            self._database.commit()
+
+    def annotate_branch(
+        self,
+        branch_id: int,
+        attributes: Mapping[str, Any],
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Merge JSON metadata into an execution branch."""
+
+        execution_branch = self._database.get(ExecutionBranch, branch_id)
+        if execution_branch is None:
+            raise LookupError(f"No execution branch with id {branch_id!r}")
+        selected = self._validated_attributes(attributes)
+        execution_branch.attributes = {
+            **execution_branch.attributes,
+            **selected,
+        }
+        self._database.flush()
+        if commit:
+            self._database.commit()
+
+    @staticmethod
+    def _validated_attributes(attributes: Mapping[str, Any]) -> dict[str, Any]:
+        selected = dict(attributes)
+        if not all(isinstance(key, str) for key in selected):
+            raise TypeError("attribute keys must be strings")
+        json.dumps(selected)
+        return selected
+
     def begin_recording(
         self,
         *,

@@ -24,6 +24,18 @@ space.close()
 Opening the runtime installs all process-level declarations. Functions are
 only persisted while a recording or replay branch is active.
 
+In-process integrations can discover the user-owned runtime without importing
+core monitoring state:
+
+```python
+space = spacetimepy.get_active_spacetime()
+```
+
+This returns the currently open runtime or `None`. Integrations may attach
+JSON metadata through `space.capture.annotate_session(...)` and
+`space.capture.annotate_branch(...)`; trace consumers receive it through the
+corresponding public DTO attributes.
+
 ## Capture hooks
 
 Start and return hooks can derive JSON metadata from a captured invocation.

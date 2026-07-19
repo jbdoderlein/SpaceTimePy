@@ -54,6 +54,33 @@ class TestCaptureInterface(SpaceTimeTestCase):
         self.assertEqual(session.status, "completed")
         self.assertEqual(branch.status, "completed")
 
+    def test_integrations_can_annotate_sessions_and_branches(self) -> None:
+        with self.space.capture.recording(
+            attributes={"existing": "session"},
+            branch_attributes={"existing": "branch"},
+        ) as recording:
+            pass
+
+        self.space.capture.annotate_session(
+            recording.session_id,
+            {"baseline": "variant-a"},
+        )
+        self.space.capture.annotate_branch(
+            recording.branch_id,
+            {"summary": [1, 2, 3]},
+        )
+
+        session = self.space.data.get_session(recording.session_id)
+        branch = self.space.data.get_branch(recording.branch_id)
+        self.assertEqual(
+            session.attributes,
+            {"existing": "session", "baseline": "variant-a"},
+        )
+        self.assertEqual(
+            branch.attributes,
+            {"existing": "branch", "summary": [1, 2, 3]},
+        )
+
     def test_disabled_context_skips_calls_without_changing_positions(self) -> None:
         @self.space.capture.function
         def calculate(value: int) -> int:

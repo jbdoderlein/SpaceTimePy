@@ -54,7 +54,7 @@ from .replay import (
     ReplayInterface,
     ReplayResult,
 )
-from .runtime import SpaceTime, open_spacetime
+from .runtime import SpaceTime, get_active_spacetime, open_spacetime
 
 __all__ = [
     "BranchDTO",
@@ -96,6 +96,7 @@ __all__ = [
     "clear_capture_declarations",
     "external",
     "function",
+    "get_active_spacetime",
     "line",
     "open_spacetime",
     "support",

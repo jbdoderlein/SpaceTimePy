@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
 
 
+_active_runtime: SpaceTime | None = None
+
+
 class SpaceTime:
     """Own one database unit of work and the three public interfaces.
 
@@ -44,6 +47,10 @@ class SpaceTime:
         tool_id: int | None = None,
         custom_picklers: Iterable[CustomPickler] = (),
     ) -> None:
+        global _active_runtime
+        if _active_runtime is not None and not _active_runtime.is_closed:
+            raise RuntimeError("A SpaceTime runtime is already active in this process")
+
         self._serializer = PickleSerializer(custom_picklers)
         monitor_options: dict[str, Any] = {
             "flush_batch_size": flush_batch_size,
@@ -71,6 +78,7 @@ class SpaceTime:
             self.data = TraceData(database, self._serializer)
             self.replay = ReplayInterface(database, self._monitor, self.data)
             capture_registry.bind(self._monitor)
+            _active_runtime = self
         except BaseException:
             self._standard_external_interactions.stop()
             self._monitor.shutdown(commit=False)
@@ -146,6 +154,7 @@ class SpaceTime:
     def close(self, *, commit: bool = True) -> None:
         """Detach monitoring and optionally close the owned ORM resources."""
 
+        global _active_runtime
         if self._closed:
             return
         if self._monitor.current_branch is not None:
@@ -165,6 +174,8 @@ class SpaceTime:
             if self._engine is not None:
                 self._engine.dispose()
         self._closed = True
+        if _active_runtime is self:
+            _active_runtime = None
 
     def __enter__(self) -> SpaceTime:
         self._ensure_open()
@@ -203,4 +214,11 @@ def open_spacetime(
     return SpaceTime.open(database, **options)
 
 
-__all__ = ["SpaceTime", "open_spacetime"]
+def get_active_spacetime() -> SpaceTime | None:
+    """Return the open process runtime used by in-process integrations."""
+
+    runtime = _active_runtime
+    return runtime if runtime is not None and not runtime.is_closed else None
+
+
+__all__ = ["SpaceTime", "get_active_spacetime", "open_spacetime"]
