@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 from spacetimepy import ReplayDivergenceError, ReplayError
 from spacetimepy.core.monitoring import SpaceTimeMonitor
 from tests.support import SpaceTimeTestCase
@@ -129,6 +131,171 @@ class TestReplayInterface(SpaceTimeTestCase):
         self.assertEqual(context.options, {"debugger": "attached"})
         self.assertNotIn("debugger", branch.recipe)
         self.assertEqual(branch.steps[0].source_step_id, source.id)
+
+    def test_active_execution_moves_to_replacement_frame_and_child_branch(self) -> None:
+        replay_context = None
+        replacement_line = None
+
+        def replacement(source_frame, value: int) -> int:
+            nonlocal replay_context, replacement_line
+            replacement_frame = inspect.currentframe()
+            assert replacement_frame is not None
+            replay_context = self.space.replay.begin_active_execution(
+                source_frame=source_frame,
+                replacement_frame=replacement_frame,
+                replacement_target=replacement,
+                replacement_line_numbers=(),
+                name="edited code",
+                recipe={"integration": "test-hotswap"},
+            )
+            # debugpy can emit PY_START again when set-next-statement redirects
+            # this already transferred frame. The recorder must treat it as
+            # the same logical call instead of disabling all later line events.
+            monitor = SpaceTimeMonitor.get_instance()
+            assert monitor is not None
+            monitor._monitor_callback_function_start(replacement.__code__, 0)
+            self.assertIsNone(monitor.last_callback_error)
+            self.assertTrue(monitor.is_recording_enabled)
+            replacement_line = replacement_frame.f_lineno + 1
+            self.space.replay.record_active_replacement_state(
+                frame=replacement_frame,
+                line_number=replacement_line,
+                replacement_line_numbers={replacement_line},
+            )
+            # VS Code commits at each debugger stop so the explorer API can
+            # read the active branch from its separate process.
+            self.space.commit()
+            value += 10
+            return value
+
+        def original(value: int) -> int:
+            value += 1
+            source_frame = inspect.currentframe()
+            assert source_frame is not None
+            return replacement(source_frame, value)
+
+        original = self.space.capture.line(original)
+        with self.space.capture.recording(mode="line") as recording:
+            self.assertEqual(original(2), 13)
+            child = self.space.replay.finish()
+
+        assert replay_context is not None
+        root = self.space.data.get_branch(recording.branch_id)
+        session = self.space.data.get_session(recording.session_id)
+        self.assertEqual(child.parent_branch_id, root.id)
+        self.assertEqual(child.forked_from_step_id, replay_context.forked_from_step.id)
+        self.assertEqual(child.steps[0].source_step_id, child.forked_from_step_id)
+        self.assertEqual(child.recipe, {"integration": "test-hotswap"})
+        self.assertEqual(root.status, "completed")
+        self.assertEqual(session.status, "completed")
+        replacement_snapshot = child.steps[0].stack_snapshot
+        assert replacement_snapshot is not None
+        assert replacement_line is not None
+        self.assertEqual(replacement_snapshot.line_number, replacement_line)
+        assert replacement_snapshot.code_definition_id is not None
+        replacement_code = self.space.data.get_code_definition(
+            replacement_snapshot.code_definition_id
+        )
+        self.assertIn("replacement", replacement_code.qualified_name)
+
+    def test_active_execution_can_refork_from_a_historical_checkpoint(self) -> None:
+        first_context = None
+        checkpoint_context = None
+        historical_step_id = None
+
+        def checkpoint_replacement(
+            source_frame,
+            value: int,
+            parent_branch_id: int,
+            checkpoint_step_id: int,
+        ) -> int:
+            nonlocal checkpoint_context
+            replacement_frame = inspect.currentframe()
+            assert replacement_frame is not None
+            checkpoint_context = self.space.replay.begin_active_execution(
+                source_frame=source_frame,
+                replacement_frame=replacement_frame,
+                replacement_target=checkpoint_replacement,
+                replacement_line_numbers=(),
+                parent_branch_id=parent_branch_id,
+                forked_from_step_id=checkpoint_step_id,
+                name="checkpoint",
+            )
+            replacement_line = replacement_frame.f_lineno + 1
+            self.space.replay.record_active_replacement_state(
+                frame=replacement_frame,
+                line_number=replacement_line,
+                replacement_line_numbers={replacement_line},
+            )
+            return value + 20
+
+        def first_replacement(
+            source_frame,
+            value: int,
+            parent_branch_id: int,
+            checkpoint_step_id: int,
+        ) -> int:
+            nonlocal first_context
+            replacement_frame = inspect.currentframe()
+            assert replacement_frame is not None
+            first_context = self.space.replay.begin_active_execution(
+                source_frame=source_frame,
+                replacement_frame=replacement_frame,
+                replacement_target=first_replacement,
+                replacement_line_numbers=(),
+                name="first edit",
+            )
+            replacement_line = replacement_frame.f_lineno + 1
+            self.space.replay.record_active_replacement_state(
+                frame=replacement_frame,
+                line_number=replacement_line,
+                replacement_line_numbers={replacement_line},
+            )
+            value += 10
+            return checkpoint_replacement(
+                replacement_frame,
+                value,
+                parent_branch_id,
+                checkpoint_step_id,
+            )
+
+        def original(value: int) -> int:
+            nonlocal historical_step_id
+            value += 1
+            source_frame = inspect.currentframe()
+            assert source_frame is not None
+            monitor = SpaceTimeMonitor.get_instance()
+            assert monitor is not None
+            monitor.flush()
+            branch = monitor.current_branch
+            assert branch is not None and branch.id is not None
+            historical_step = branch.steps[0]
+            assert historical_step.id is not None
+            historical_step_id = historical_step.id
+            return first_replacement(
+                source_frame,
+                value,
+                branch.id,
+                historical_step.id,
+            )
+
+        original = self.space.capture.line(original)
+        with self.space.capture.recording(mode="line") as recording:
+            self.assertEqual(original(2), 33)
+            final_branch = self.space.replay.finish()
+
+        assert first_context is not None
+        assert checkpoint_context is not None
+        assert historical_step_id is not None
+        first_branch = self.space.data.get_branch(first_context.branch_id)
+        self.assertEqual(first_branch.status, "completed")
+        self.assertEqual(final_branch.parent_branch_id, recording.branch_id)
+        self.assertEqual(final_branch.forked_from_step_id, historical_step_id)
+        self.assertEqual(checkpoint_context.forked_from_step.id, historical_step_id)
+        self.assertEqual(
+            final_branch.steps[0].source_step_id,
+            historical_step_id,
+        )
 
     def test_run_returns_executor_value_and_completed_branch(self) -> None:
         _, root, source, _ = self.record_external_step()

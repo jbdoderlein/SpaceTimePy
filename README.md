@@ -36,6 +36,40 @@ JSON metadata through `space.capture.annotate_session(...)` and
 `space.capture.annotate_branch(...)`; trace consumers receive it through the
 corresponding public DTO attributes.
 
+Debugger and notebook integrations that replace an executing Python frame can
+move the logical call into a same-session child branch without placing their
+frame-mutation machinery in SpaceTimePy:
+
+```python
+context = space.replay.begin_active_execution(
+    source_frame=old_frame,
+    replacement_frame=new_frame,
+    replacement_target=new_function,
+    name="edited code",
+    recipe={"integration": "my-debugger"},
+)
+```
+
+The source frame must be the single active captured call and its current step
+becomes the fork point. SpaceTimePy transfers `sys.monitoring` ownership to the
+replacement frame, closes the parent suffix, and records subsequent events in
+the child branch. The integration remains responsible for constructing the
+replacement frame, migrating state, redirecting execution, and calling
+`space.replay.finish()` when it completes.
+
+When an integration must first stop at a trampoline, it can defer automatic
+line capture with `replacement_line_numbers=()` and then call
+`space.replay.record_active_replacement_state(...)` after restoring locals.
+That explicit snapshot becomes the replacement for the fork step; normal line
+capture is enabled from the supplied replacement line set afterward.
+
+An integration exploring an earlier checkpoint in the same active session can
+also pass both `parent_branch_id` and `forked_from_step_id`. The active branch
+is closed, recorder ownership moves to the replacement frame, and the new
+branch is attached to the selected historical path. This operation can
+supersede an earlier active replacement context, enabling repeated interactive
+forks in one debug session.
+
 ## JSON API and web explorer
 
 Run the combined v2 API and browser explorer for an existing trusted trace:

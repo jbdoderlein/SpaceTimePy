@@ -30,7 +30,8 @@ from spacetimepy.interface.data import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Collection, Iterator, Mapping
+    from types import FrameType
 
     from sqlalchemy.orm import Session
 
@@ -212,6 +213,13 @@ class ReplayInterface:
         self._data = data
         self._active_context: ReplayContext | None = None
 
+    @property
+    def active_session_id(self) -> int | None:
+        """Return the session currently owned by the live recorder, if any."""
+
+        session = self._monitor.current_session
+        return session.id if session is not None else None
+
     def prepare(
         self,
         *,
@@ -283,6 +291,134 @@ class ReplayInterface:
         self._monitor.start_branch(branch)
         self._active_context = context
         return context
+
+    def begin_active_execution(
+        self,
+        *,
+        source_frame: FrameType,
+        replacement_frame: FrameType,
+        replacement_target: Callable[..., Any],
+        replacement_line_numbers: Collection[int] | None = None,
+        parent_branch_id: int | None = None,
+        forked_from_step_id: int | None = None,
+        name: str | None = None,
+        configuration_key: str | None = None,
+        recipe: Mapping[str, Any] | None = None,
+        attributes: Mapping[str, Any] | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> ReplayContext:
+        """Fork an active recording while an integration replaces its frame.
+
+        SpaceTimePy transfers recorder ownership but does not mutate either
+        frame.  The integration must create the replacement frame, migrate its
+        state, and redirect execution.
+        """
+
+        active_branch = self._monitor.current_branch
+        execution_session = self._monitor.current_session
+        if active_branch is None or execution_session is None:
+            raise ReplayError("No SpaceTime recording is active")
+        if (
+            self._active_context is not None
+            and self._active_context.branch_id != active_branch.id
+        ):
+            raise ReplayError("Another SpaceTime replay is already active")
+        if active_branch.id is None:
+            self._monitor.flush()
+        if active_branch.id is None:
+            raise ReplayError("The active branch has no persistent ID")
+
+        if parent_branch_id is None:
+            active_step = self._monitor.active_step_for_frame(source_frame)
+            if active_step is None or active_step.id is None:
+                self._monitor.flush()
+                active_step = self._monitor.active_step_for_frame(source_frame)
+            if active_step is None or active_step.id is None:
+                raise ReplayError("The active frame has no recorded step to fork")
+            selected_step_id = forked_from_step_id or active_step.id
+            if selected_step_id != active_step.id:
+                raise ReplayError(
+                    "A historical active fork requires its parent branch ID"
+                )
+            parent = active_branch
+            source = active_step
+        else:
+            if forked_from_step_id is None:
+                raise ReplayError(
+                    "A historical active fork requires its forked-from step ID"
+                )
+            parent, source = self._require_parent_and_source(
+                parent_branch_id,
+                forked_from_step_id,
+            )
+            if parent.session_id != execution_session.id:
+                raise ReplayError(
+                    "An active execution can only explore a checkpoint from "
+                    "its current session"
+                )
+            selected_step_id = forked_from_step_id
+
+        context = self._build_context(
+            branch_id=-1,
+            session_id=execution_session.id,
+            parent_branch_id=parent.id,
+            forked_from_step_id=selected_step_id,
+            recipe=recipe,
+            options=options,
+        )
+        branch = ExecutionBranch(
+            session=execution_session,
+            parent_branch=parent,
+            forked_from_step=source,
+            name=name,
+            status=ExecutionStatus.OPEN,
+            configuration_key=configuration_key,
+            recipe=dict(recipe or {}),
+            attributes=dict(attributes or {}),
+        )
+        self._database.add(branch)
+        self._database.flush()
+        if branch.id is None:
+            raise ReplayError("The database did not assign an active replay branch ID")
+
+        context.branch_id = branch.id
+        self._monitor.replace_active_execution(
+            branch,
+            source_frame=source_frame,
+            replacement_frame=replacement_frame,
+            replacement_target=replacement_target,
+            replacement_line_numbers=replacement_line_numbers,
+        )
+        self._active_context = context
+        return context
+
+    def record_active_replacement_state(
+        self,
+        *,
+        frame: FrameType,
+        line_number: int,
+        replacement_line_numbers: Collection[int] | None = None,
+    ) -> None:
+        """Record restored replacement locals at their debugger-mapped line.
+
+        This is the second half of :meth:`begin_active_execution` for
+        integrations that must enter replacement code through an earlier
+        trampoline or breakpoint before redirecting execution.
+        """
+
+        context = self._active_context
+        branch = self._monitor.current_branch
+        if context is None or branch is None:
+            raise ReplayError("No SpaceTime replay is active")
+        if branch.id != context.branch_id:
+            raise ReplayError("The active monitor branch is not this replay")
+
+        self._monitor.record_active_replacement_state(
+            frame,
+            line_number,
+            line_numbers=replacement_line_numbers,
+        )
+        self._monitor.flush()
 
     def finish(
         self,

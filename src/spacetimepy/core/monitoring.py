@@ -33,7 +33,7 @@ import types
 import uuid
 from collections.abc import Callable, Collection, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -348,6 +348,11 @@ class SpaceTimeMonitor:
         del callback_frame
         if frame is None:
             return
+        # Debugger set-next-statement operations can make CPython emit PY_START
+        # again for the same live frame.  The frame already represents the
+        # transferred logical call, so the repeated notification is idempotent.
+        if id(frame) in self._active_calls_by_frame:
+            return
         if (
             registration.role == CallRole.EXTERNAL_INTERACTION
             and self._nearest_owner_step(frame.f_back) is None
@@ -464,7 +469,7 @@ class SpaceTimeMonitor:
         callback_frame = inspect.currentframe()
         frame = callback_frame.f_back if callback_frame is not None else None
         del callback_frame
-        if frame is None:
+        if frame is None or id(frame) not in self._active_calls_by_frame:
             return
 
         self._inside_callback = True
@@ -516,6 +521,161 @@ class SpaceTimeMonitor:
         self._next_step_position = last_position + 1
         self._next_external_positions.clear()
         return branch
+
+    def active_step_for_frame(
+        self,
+        frame: types.FrameType,
+    ) -> ExecutionStep | None:
+        """Return the current timeline step owned by a captured frame."""
+
+        active = self._active_calls_by_frame.get(id(frame))
+        return active.current_step if active is not None else None
+
+    def replace_active_execution(
+        self,
+        branch: ExecutionBranch,
+        *,
+        source_frame: types.FrameType,
+        replacement_frame: types.FrameType,
+        replacement_target: types.CodeType | Callable[..., Any],
+        replacement_line_numbers: Collection[int] | None = None,
+    ) -> None:
+        """Move one active logical call to replacement code and a child branch.
+
+        This is a low-level integration boundary for debuggers and notebook
+        runtimes.  It changes only recorder bookkeeping and ``sys.monitoring``
+        registrations; callers remain responsible for creating and migrating
+        the replacement Python frame itself.
+        """
+
+        active_branch = self._require_branch()
+        active = self._active_calls_by_frame.get(id(source_frame))
+        if active is None:
+            raise MonitoringStateError("The source frame is not an active captured call")
+        self._ensure_top_active(active)
+        if len(self._active_calls) != 1:
+            raise MonitoringStateError(
+                "Active execution replacement currently requires one captured call"
+            )
+        if id(replacement_frame) in self._active_calls_by_frame:
+            raise MonitoringStateError("The replacement frame is already captured")
+        if branch.session is not active_branch.session:
+            raise MonitoringStateError(
+                "The replacement branch must remain in the active session"
+            )
+
+        replacement_code = self._code_from_target(replacement_target)
+        if replacement_frame.f_code is not replacement_code:
+            raise MonitoringStateError(
+                "The replacement target does not own the replacement frame"
+            )
+        registration = self._captures.get(active.code)
+        if registration is None:
+            raise MonitoringStateError("The active call has no capture registration")
+
+        # The abandoned frame must not emit more lines or a return.  Installing
+        # events for the replacement code while it is already executing does
+        # not synthesize a second PY_START event; its later lines and return are
+        # routed to the transferred active call.
+        sys.monitoring.set_local_events(self.tool_id, active.code, 0)
+        self._captures.pop(active.code, None)
+        new_registration = replace(
+            registration,
+            code=replacement_code,
+            line_numbers=(
+                registration.line_numbers
+                if replacement_line_numbers is None
+                else frozenset(replacement_line_numbers)
+            ),
+        )
+        self._captures[replacement_code] = new_registration
+        self._store_code_definition(replacement_code)
+        self._global_names_for_code(replacement_code)
+        events = sys.monitoring.events.PY_START | sys.monitoring.events.PY_RETURN
+        if new_registration.capture_lines:
+            events |= sys.monitoring.events.LINE
+        sys.monitoring.set_local_events(self.tool_id, replacement_code, events)
+        self._refresh_global_events()
+
+        self._active_calls_by_frame.pop(active.frame_id, None)
+        active.frame_id = id(replacement_frame)
+        active.code = replacement_code
+        active.current_step = None
+        self._active_calls_by_frame[active.frame_id] = active
+
+        active_branch.status = ExecutionStatus.COMPLETED
+        active_branch.completed_at = self._now()
+        branch.status = ExecutionStatus.OPEN
+        branch.completed_at = None
+        self.database.add(branch)
+        self.current_branch = branch
+        self.current_session = branch.session
+        self._next_step_position = 0
+        self._next_external_positions.clear()
+        self.database.flush()
+
+    def record_active_replacement_state(
+        self,
+        frame: types.FrameType,
+        line_number: int,
+        *,
+        line_numbers: Collection[int] | None = None,
+    ) -> StackSnapshot:
+        """Record migrated state as the first step of a replacement branch.
+
+        Debugger integrations enter replacement code through a trampoline and
+        redirect the frame only after restoring its locals.  Automatic line
+        events must stay filtered during that transition; this method records
+        the restored state at the intended destination line, then enables the
+        replacement's normal line selection.
+        """
+
+        active = self._active_calls_by_frame.get(id(frame))
+        if active is None:
+            raise MonitoringStateError("The replacement frame is not active")
+        self._ensure_top_active(active)
+        registration = self._captures.get(active.code)
+        if registration is None or registration.code is not frame.f_code:
+            raise MonitoringStateError(
+                "The replacement frame has no capture registration"
+            )
+        if not registration.capture_lines:
+            raise MonitoringStateError(
+                "Active replacement state requires line capture"
+            )
+        if active.current_step is not None or self._next_step_position != 0:
+            raise MonitoringStateError(
+                "The replacement state must be the first child-branch step"
+            )
+
+        selected_lines = (
+            None if line_numbers is None else frozenset(line_numbers)
+        )
+        if selected_lines is not None and line_number not in selected_lines:
+            raise MonitoringStateError(
+                f"Replacement line {line_number} is not selected for capture"
+            )
+
+        attributes = self._call_line_attributes(
+            registration,
+            frame,
+            line_number,
+        )
+        snapshot = self.record_stack_snapshot(
+            frame,
+            line_number,
+            code=frame.f_code,
+            ignored_names=registration.ignored_names,
+            attributes=attributes,
+        )
+        if snapshot is None:
+            raise MonitoringStateError("The replacement snapshot was not recorded")
+
+        self._captures[active.code] = replace(
+            registration,
+            line_numbers=selected_lines,
+        )
+        return snapshot
 
     def finish_branch(
         self,

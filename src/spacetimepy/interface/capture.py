@@ -900,10 +900,43 @@ class CaptureInterface:
         try:
             yield handle
         except BaseException:
-            self.finish_recording(ExecutionStatus.FAILED.value, commit=commit)
+            self._finish_recording_scope(
+                handle,
+                ExecutionStatus.FAILED,
+                commit=commit,
+            )
             raise
         else:
-            self.finish_recording(ExecutionStatus.COMPLETED.value, commit=commit)
+            self._finish_recording_scope(
+                handle,
+                ExecutionStatus.COMPLETED,
+                commit=commit,
+            )
+
+    def _finish_recording_scope(
+        self,
+        handle: RecordingHandle,
+        status: ExecutionStatus,
+        *,
+        commit: bool,
+    ) -> None:
+        branch = self._monitor.current_branch
+        execution_session = self._monitor.current_session
+        if branch is not None and execution_session is not None:
+            if execution_session.id != handle.session_id:
+                raise RuntimeError("Another SpaceTime session replaced this recording")
+            if branch.parent_branch is not None:
+                raise RuntimeError(
+                    "The active replay must be finished before its root recording exits"
+                )
+            self.finish_recording(status.value, commit=commit)
+            return
+
+        persisted_session = self._database.get(ExecutionSession, handle.session_id)
+        if persisted_session is None or persisted_session.status == ExecutionStatus.OPEN:
+            raise RuntimeError("The SpaceTime recording ended without an active branch")
+        if commit:
+            self._database.commit()
 
     @staticmethod
     def _capture_mode(mode: CaptureMode | str) -> CaptureMode:
