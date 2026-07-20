@@ -3,7 +3,8 @@
 The active suite is organized by architectural responsibility:
 
 - `core/`: persistence-model invariants and the low-level VM recorder;
-- `interface/`: capture declarations, DTO access, replay, and runtime lifecycle;
+- `interface/`: capture declarations, DTO access, replay, runtime lifecycle,
+  web adapters, and the read-only MCP contract;
 - `integration/`: complete user-facing workflows across those layers;
 - `old/`: archived v1 tests, excluded from active discovery.
 

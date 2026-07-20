@@ -26,10 +26,12 @@ dependencies = [
     "tqdm>=4.67.1",
     "fastapi>=0.115.12",
     "jinja2>=3.1.0",
+    "mcp>=1.27,<2",
     "uvicorn>=0.34.2",
 ]
 
 [project.scripts]
+spacetimepy-mcp = "spacetimepy.interface.mcp.server:main"
 web-spacetimepy = "spacetimepy.interface.web.explorer:main"
 
 [tool.hatch.build.targets.wheel]

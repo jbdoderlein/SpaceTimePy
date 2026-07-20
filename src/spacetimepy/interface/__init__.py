@@ -47,6 +47,7 @@ from .data import (
     TraceNotFoundError,
     TraceStatisticsDTO,
 )
+from .mcp.service import AgentTraceService
 from .replay import (
     ExternalInteractionScript,
     RecordedExternalInteraction,
@@ -98,7 +99,25 @@ def run_explorer(*args, **kwargs):
 
     return run(*args, **kwargs)
 
+
+def create_mcp_server(*args, **kwargs):
+    """Lazily create the read-only SpaceTime trace MCP server."""
+
+    from .mcp import create_mcp_server as create
+
+    return create(*args, **kwargs)
+
+
+def run_mcp(*args, **kwargs):
+    """Lazily run the read-only SpaceTime trace MCP server."""
+
+    from .mcp import run_mcp as run
+
+    return run(*args, **kwargs)
+
+
 __all__ = [
+    "AgentTraceService",
     "BranchDTO",
     "BranchSummaryDTO",
     "CaptureDeclaration",
@@ -140,6 +159,7 @@ __all__ = [
     "clear_capture_declarations",
     "create_api_app",
     "create_explorer_app",
+    "create_mcp_server",
     "external",
     "function",
     "get_active_spacetime",
@@ -147,6 +167,7 @@ __all__ = [
     "open_spacetime",
     "run_api",
     "run_explorer",
+    "run_mcp",
     "start_api",
     "support",
     "unregister_capture_declaration",

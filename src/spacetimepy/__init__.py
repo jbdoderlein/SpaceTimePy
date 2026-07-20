@@ -1,6 +1,7 @@
 """SpaceTimePy public programmatic interface."""
 
 from .interface import (
+    AgentTraceService,
     BranchDTO,
     BranchSummaryDTO,
     CaptureDeclaration,
@@ -42,6 +43,7 @@ from .interface import (
     clear_capture_declarations,
     create_api_app,
     create_explorer_app,
+    create_mcp_server,
     external,
     function,
     get_active_spacetime,
@@ -49,6 +51,7 @@ from .interface import (
     open_spacetime,
     run_api,
     run_explorer,
+    run_mcp,
     start_api,
     support,
     unregister_capture_declaration,
@@ -57,6 +60,7 @@ from .interface import (
 __version__ = "2.0.0"
 
 __all__ = [
+    "AgentTraceService",
     "BranchDTO",
     "BranchSummaryDTO",
     "CaptureDeclaration",
@@ -98,6 +102,7 @@ __all__ = [
     "clear_capture_declarations",
     "create_api_app",
     "create_explorer_app",
+    "create_mcp_server",
     "external",
     "function",
     "get_active_spacetime",
@@ -105,6 +110,7 @@ __all__ = [
     "open_spacetime",
     "run_api",
     "run_explorer",
+    "run_mcp",
     "start_api",
     "support",
     "unregister_capture_declaration",

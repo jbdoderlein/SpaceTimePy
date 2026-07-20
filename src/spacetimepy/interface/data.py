@@ -16,6 +16,7 @@ from sqlalchemy import Engine, create_engine, func, inspect, select
 from sqlalchemy.orm import Session
 
 from spacetimepy.core.model import (
+    Base,
     CodeDefinition,
     ExecutionBranch,
     ExecutionSession,
@@ -215,31 +216,64 @@ class TraceData:
         database: str | Path,
         *,
         custom_picklers: Iterable[CustomPickler] = (),
+        create_if_missing: bool = False,
     ) -> TraceData:
-        """Open an existing trace database for read-oriented exploration.
+        """Open a trace database for read-oriented exploration.
 
         Unlike :meth:`SpaceTime.open`, this does not initialize monitoring or
-        create a schema. Pickled values are executable data, so callers must
-        only open trace files they trust.
+        normally create a schema. ``create_if_missing`` may initialize an empty
+        v2 SQLite trace at a filesystem path, which is useful when an explorer
+        must start before the first recording. It never modifies an existing
+        file without a v2 schema. Pickled values are executable data, so callers
+        must only open trace files they trust.
         """
 
         database_label = str(database)
+        create_schema = False
         if isinstance(database, Path):
             selected_path = database.expanduser().resolve()
-            if not selected_path.is_file():
+            if selected_path.exists() and not selected_path.is_file():
+                raise TraceDataError(
+                    f"Trace database path is not a file: {selected_path}"
+                )
+            if not selected_path.exists() and not create_if_missing:
                 raise FileNotFoundError(f"Trace database not found: {selected_path}")
+            if not selected_path.exists():
+                if not selected_path.parent.is_dir():
+                    raise FileNotFoundError(
+                        f"Trace database parent directory not found: "
+                        f"{selected_path.parent}"
+                    )
+                create_schema = True
             url = f"sqlite+pysqlite:///{selected_path}"
             database_label = str(selected_path)
         elif "://" in database:
+            if create_if_missing:
+                raise ValueError(
+                    "create_if_missing only supports a SQLite filesystem path"
+                )
             url = database
         else:
             selected_path = Path(database).expanduser().resolve()
-            if not selected_path.is_file():
+            if selected_path.exists() and not selected_path.is_file():
+                raise TraceDataError(
+                    f"Trace database path is not a file: {selected_path}"
+                )
+            if not selected_path.exists() and not create_if_missing:
                 raise FileNotFoundError(f"Trace database not found: {selected_path}")
+            if not selected_path.exists():
+                if not selected_path.parent.is_dir():
+                    raise FileNotFoundError(
+                        f"Trace database parent directory not found: "
+                        f"{selected_path.parent}"
+                    )
+                create_schema = True
             url = f"sqlite+pysqlite:///{selected_path}"
             database_label = str(selected_path)
 
         engine = create_engine(url)
+        if create_schema:
+            Base.metadata.create_all(engine)
         if not inspect(engine).has_table("execution_sessions"):
             engine.dispose()
             raise TraceDataError(
@@ -266,6 +300,10 @@ class TraceData:
         """Expire cached rows so following reads observe committed changes."""
 
         self._ensure_open()
+        if self._owns_database:
+            # End a path-backed reader transaction before looking for commits
+            # produced by a recording process that uses the same SQLite file.
+            self._database.rollback()
         self._database.expire_all()
 
     def close(self) -> None:
@@ -310,9 +348,7 @@ class TraceData:
         )
 
     def get_function_call(self, call_id: int) -> FunctionCallDTO:
-        return self._call_to_dto(
-            self._require(FunctionCall, call_id, "function call")
-        )
+        return self._call_to_dto(self._require(FunctionCall, call_id, "function call"))
 
     def get_stack_snapshot(self, snapshot_id: int) -> StackSnapshotDTO:
         return self._snapshot_to_dto(
@@ -320,9 +356,7 @@ class TraceData:
         )
 
     def get_code_definition(self, definition_id: str) -> CodeDefinitionDTO:
-        definition = self._require(
-            CodeDefinition, definition_id, "code definition"
-        )
+        definition = self._require(CodeDefinition, definition_id, "code definition")
         return CodeDefinitionDTO(
             id=definition.id,
             name=definition.name,
@@ -453,9 +487,7 @@ class TraceData:
 
         if reference is None:
             return None
-        return self._deserialize(
-            self._require(StoredObject, reference, "stored value")
-        )
+        return self._deserialize(self._require(StoredObject, reference, "stored value"))
 
     def load_values(self, references: Collection[str]) -> dict[str, Any]:
         """Materialize several references with one database query.
@@ -484,16 +516,16 @@ class TraceData:
         """Materialize a captured locals/globals reference mapping."""
 
         values = self.load_values(references.values())
-        return {
-            name: values[reference]
-            for name, reference in references.items()
-        }
+        return {name: values[reference] for name, reference in references.items()}
 
     def resolve_branch_step_ids(self, branch_id: int) -> tuple[int, ...]:
         """Return IDs in the complete inherited-and-recomputed branch path."""
 
         branch = self._require(ExecutionBranch, branch_id, "execution branch")
-        return tuple(self._id(step, "execution step") for step in self._resolve_step_models(branch))
+        return tuple(
+            self._id(step, "execution step")
+            for step in self._resolve_step_models(branch)
+        )
 
     def _resolve_step_models(
         self,
@@ -509,15 +541,11 @@ class TraceData:
         own_steps = list(branch.steps)
         if branch.parent_branch is None:
             if branch.forked_from_step is not None:
-                raise TraceConsistencyError(
-                    f"Root branch {branch_id} has a fork step"
-                )
+                raise TraceConsistencyError(f"Root branch {branch_id} has a fork step")
             return own_steps
 
         if branch.forked_from_step is None:
-            raise TraceConsistencyError(
-                f"Child branch {branch_id} has no fork step"
-            )
+            raise TraceConsistencyError(f"Child branch {branch_id} has no fork step")
 
         parent_path = self._resolve_step_models(
             branch.parent_branch, ancestors | {branch_id}
@@ -589,7 +617,9 @@ class TraceData:
             forked_from_step_id=branch.forked_from_step_id,
             child_branch_ids=tuple(
                 self._id(child, "execution branch")
-                for child in sorted(branch.child_branches, key=lambda child: child.id or 0)
+                for child in sorted(
+                    branch.child_branches, key=lambda child: child.id or 0
+                )
             ),
             name=branch.name,
             status=branch.status.value,
@@ -663,8 +693,7 @@ class TraceData:
             id=self._id(snapshot, "stack snapshot"),
             function_call_id=snapshot.function_call_id,
             code_definition_id=(
-                snapshot.code_definition_id
-                or snapshot.function_call.code_definition_id
+                snapshot.code_definition_id or snapshot.function_call.code_definition_id
             ),
             line_number=snapshot.line_number,
             instruction_offset=snapshot.instruction_offset,

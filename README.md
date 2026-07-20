@@ -87,6 +87,83 @@ Opening stored values may execute pickle data. Only explore databases you
 trust, and supply the same custom pickler providers used during capture when
 their classes are needed.
 
+## MCP trace explorer for AI agents
+
+Expose a v2 trace path to an MCP-capable coding agent using the local stdio
+transport:
+
+```bash
+uv run spacetimepy-mcp trace.db
+```
+
+If `trace.db` does not exist, the MCP initializes an empty v2 trace and starts
+normally. It can therefore provide the capture guide before the first run. The
+same server observes committed sessions after an instrumented application
+records into that file; no MCP restart is required.
+
+For a client configuration, use an absolute database path so the selected
+trace does not depend on the client's working directory:
+
+```json
+{
+  "mcpServers": {
+    "spacetimepy": {
+      "command": "spacetimepy-mcp",
+      "args": ["/absolute/path/to/trace.db"]
+    }
+  }
+}
+```
+
+The first version is read-only and exposes five bounded, agent-oriented tools:
+
+- `spacetime_trace_overview`
+- `spacetime_search_calls`
+- `spacetime_get_execution_slice`
+- `spacetime_inspect_step`
+- `spacetime_inspect_call`
+
+Trace, session, branch, step, call, and stored-source resources support
+drill-down without exposing the internal ORM model. The
+`spacetime://guides/capture` resource and `prepare_capture` prompt teach a
+coding agent how to add a small targeted capture when existing evidence is
+insufficient. The MCP itself cannot edit code, run the application, replay a
+branch, or compare traces.
+
+Primitive state is previewed safely. Non-primitive pickle values remain type
+and reference metadata by default. For a trace database you explicitly trust,
+full bounded previews can be enabled with:
+
+```bash
+uv run spacetimepy-mcp trace.db --trust-stored-values
+```
+
+This may execute pickle data. The same custom-pickler provider used during
+recording can be imported with repeatable
+`--custom-pickler MODULE[:ATTRIBUTE]` options.
+
+Streamable HTTP is available when a process transport is preferable:
+
+```bash
+uv run spacetimepy-mcp trace.db \
+  --transport streamable-http \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+The MCP endpoint is `http://127.0.0.1:8000/mcp`. This read-only first version
+has no remote authentication and rejects non-loopback bind addresses.
+
+Applications can also create the server over a path, a `TraceData` reader, or
+an open `SpaceTime` runtime:
+
+```python
+import spacetimepy
+
+mcp = spacetimepy.create_mcp_server("trace.db")
+mcp.run()
+```
+
 ## Capture hooks
 
 Start and return hooks can derive JSON metadata from a captured invocation.
