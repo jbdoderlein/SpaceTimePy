@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}SpaceTimePy · Sessions{% endblock %}
+{% block content %}<h1>Sessions & Branches</h1><p class="muted">Each session contains one root execution and its replay branches.</p><div id="sessions" class="grid three"><p class="muted">Loading…</p></div>{% endblock %}
+{% block scripts %}
+<script>
+  fetchJson('/api/sessions').then(data=>document.getElementById('sessions').innerHTML=data.sessions.length?data.sessions.slice().reverse().map(session=>`<a class="card" style="text-decoration:none;color:inherit" href="/session/${session.id}"><div class="card-header row"><span>${escapeHtml(session.name||`Session ${session.id}`)}</span><span class="badge ${session.status==='completed'?'ok':''}">${escapeHtml(session.status)}</span></div><div class="card-body"><p>${escapeHtml(session.description||'No description')}</p><div class="row"><span class="badge">${escapeHtml(session.step_kind)}</span><span class="badge brand">${session.branch_count} branches</span></div><p class="muted">${escapeHtml(session.start_time||'')}</p></div></a>`).join(''):'<p class="muted">No sessions.</p>').catch(error=>document.getElementById('sessions').innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`);
+</script>
+{% endblock %}

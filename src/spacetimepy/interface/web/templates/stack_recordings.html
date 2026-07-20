@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}SpaceTimePy · Stack Recordings{% endblock %}
+{% block content %}
+<h1>Stack Recordings</h1><p class="muted">Function calls with line-level snapshots.</p>
+<div id="recordings" class="stack"><p class="muted">Loading…</p></div>
+{% endblock %}
+{% block scripts %}
+<script>
+  fetchJson('/api/function-calls?limit=5000').then(data=>{const items=data.function_calls.filter(call=>call.has_stack_recording); document.getElementById('recordings').innerHTML=items.length?items.map(call=>`<a class="list-item" style="text-decoration:none;color:inherit" href="/stack-recording/${call.id}"><div class="row"><strong>${escapeHtml(call.qualified_name||call.function)}</strong><span class="badge brand">${call.snapshot_count} frames</span></div><div class="muted">${escapeHtml(call.file||'')}:${call.line??'?'}</div><small class="muted">${escapeHtml(call.start_time||'')}</small></a>`).join(''):'<p class="muted">No line-level recordings.</p>';}).catch(error=>document.getElementById('recordings').innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`);
+</script>
+{% endblock %}

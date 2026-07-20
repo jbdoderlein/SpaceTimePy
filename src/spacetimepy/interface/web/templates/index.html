@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}SpaceTimePy · Function Calls{% endblock %}
+{% block content %}
+<h1>Database Explorer</h1>
+<p class="muted">Browse recorded Python VM calls and their captured state.</p>
+<div class="row" style="margin-bottom:16px">
+  <input id="search" class="grow" placeholder="Search function, module, or file">
+  <input id="function-filter" placeholder="Function filter">
+  <input id="file-filter" placeholder="File filter">
+  <button id="refresh" class="primary">Search</button>
+</div>
+<div class="grid two">
+  <section class="card"><div class="card-header">Function Calls <span id="count" class="badge"></span></div><div id="calls" class="card-body stack"><p class="muted">Loading…</p></div></section>
+  <section class="card"><div class="card-header">Call Details</div><div id="details" class="card-body"><p class="muted">Select a function call.</p></div></section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  const calls = document.getElementById('calls');
+  const details = document.getElementById('details');
+  async function loadCalls() {
+    calls.innerHTML='<p class="muted">Loading…</p>';
+    const params=new URLSearchParams({search:search.value,function:document.getElementById('function-filter').value,file:document.getElementById('file-filter').value});
+    try { const data=await fetchJson(`/api/function-calls?${params}`); document.getElementById('count').textContent=data.total;
+      calls.innerHTML=data.function_calls.length ? data.function_calls.map(call => `<div class="list-item" data-id="${call.id}"><div class="row"><strong>${escapeHtml(call.qualified_name || call.function)}</strong><span class="badge ${call.outcome==='returned'?'ok':''}">${escapeHtml(call.outcome)}</span>${call.has_stack_recording?'<span class="badge brand">stack</span>':''}</div><div class="muted">${escapeHtml(call.file || 'unknown file')}:${call.line ?? '?'}</div><small class="muted">${escapeHtml(call.start_time || '')} · ${call.duration ?? '—'}s</small></div>`).join('') : '<p class="muted">No matching calls.</p>';
+      calls.querySelectorAll('[data-id]').forEach(item => item.onclick=()=>loadDetails(item.dataset.id,item));
+    } catch(error){calls.innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`;}
+  }
+  async function loadDetails(id,item){ document.querySelectorAll('.list-item').forEach(x=>x.classList.remove('selected')); item?.classList.add('selected'); details.innerHTML='<p class="muted">Loading…</p>';
+    try { const data=(await fetchJson(`/api/function-call/${id}`)).function_call; details.innerHTML=`<div class="row"><h2 style="margin:0">${escapeHtml(data.qualified_name||data.function)}</h2><span class="badge">${escapeHtml(data.outcome)}</span></div><p class="muted">${escapeHtml(data.file||'')} : ${data.line??'?'}</p><div class="row"><a class="button primary" href="/function-call/${id}">Full details</a>${data.has_stack_recording?`<a class="button" href="/stack-recording/${id}">Stack timeline</a>`:''}</div><h3 style="margin-top:20px">Locals</h3>${variableTable(data.locals)}<h3 style="margin-top:20px">Return value</h3>${variableTable({return:data.return_value})}`; }
+    catch(error){details.innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`;}
+  }
+  document.getElementById('refresh').onclick=loadCalls; [search,document.getElementById('function-filter'),document.getElementById('file-filter')].forEach(input=>input.onkeydown=event=>{if(event.key==='Enter')loadCalls();}); loadCalls();
+</script>
+{% endblock %}

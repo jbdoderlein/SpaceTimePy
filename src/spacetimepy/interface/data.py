@@ -2,16 +2,18 @@
 
 The ORM model is an internal persistence detail.  This module exposes frozen
 DTOs that can be consumed directly by Python integrations and serialized by a
-future HTTP adapter without giving callers live SQLAlchemy objects.
+HTTP adapter without giving callers live SQLAlchemy objects.
 """
 
 from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import Engine, create_engine, func, inspect, select
+from sqlalchemy.orm import Session
 
 from spacetimepy.core.model import (
     CodeDefinition,
@@ -20,15 +22,14 @@ from spacetimepy.core.model import (
     ExecutionStep,
     ExternalInteractionOccurrence,
     FunctionCall,
+    ObjectIdentity,
     StackSnapshot,
     StoredObject,
 )
-from spacetimepy.core.serialization import PickleSerializer
+from spacetimepy.core.serialization import CustomPickler, PickleSerializer
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
-
-    from sqlalchemy.orm import Session
+    from collections.abc import Collection, Iterable
 
 
 class TraceDataError(RuntimeError):
@@ -51,6 +52,28 @@ class StoredValueDTO:
     type_name: str
     is_primitive: bool
     value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class StoredValueSummaryDTO:
+    reference: str
+    identity_id: int
+    version: int
+    type_name: str
+    is_primitive: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TraceStatisticsDTO:
+    session_count: int
+    branch_count: int
+    step_count: int
+    function_call_count: int
+    stack_snapshot_count: int
+    external_interaction_count: int
+    object_identity_count: int
+    stored_value_count: int
+    code_definition_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,11 +197,98 @@ class TraceData:
         self,
         database: Session,
         serializer: PickleSerializer | None = None,
+        *,
+        engine: Engine | None = None,
+        owns_database: bool = False,
+        database_label: str | None = None,
     ) -> None:
         self._database = database
         self._serializer = serializer or PickleSerializer()
+        self._engine = engine
+        self._owns_database = owns_database
+        self._database_label = database_label
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        database: str | Path,
+        *,
+        custom_picklers: Iterable[CustomPickler] = (),
+    ) -> TraceData:
+        """Open an existing trace database for read-oriented exploration.
+
+        Unlike :meth:`SpaceTime.open`, this does not initialize monitoring or
+        create a schema. Pickled values are executable data, so callers must
+        only open trace files they trust.
+        """
+
+        database_label = str(database)
+        if isinstance(database, Path):
+            selected_path = database.expanduser().resolve()
+            if not selected_path.is_file():
+                raise FileNotFoundError(f"Trace database not found: {selected_path}")
+            url = f"sqlite+pysqlite:///{selected_path}"
+            database_label = str(selected_path)
+        elif "://" in database:
+            url = database
+        else:
+            selected_path = Path(database).expanduser().resolve()
+            if not selected_path.is_file():
+                raise FileNotFoundError(f"Trace database not found: {selected_path}")
+            url = f"sqlite+pysqlite:///{selected_path}"
+            database_label = str(selected_path)
+
+        engine = create_engine(url)
+        if not inspect(engine).has_table("execution_sessions"):
+            engine.dispose()
+            raise TraceDataError(
+                "The database does not contain a SpaceTimePy v2 trace schema"
+            )
+        database_session = Session(engine, expire_on_commit=False)
+        return cls(
+            database_session,
+            PickleSerializer(custom_picklers),
+            engine=engine,
+            owns_database=True,
+            database_label=database_label,
+        )
+
+    @property
+    def database_label(self) -> str | None:
+        return self._database_label
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def refresh(self) -> None:
+        """Expire cached rows so following reads observe committed changes."""
+
+        self._ensure_open()
+        self._database.expire_all()
+
+    def close(self) -> None:
+        """Close resources owned by :meth:`open`; borrowed sessions stay open."""
+
+        if self._closed:
+            return
+        if self._owns_database:
+            self._database.close()
+            if self._engine is not None:
+                self._engine.dispose()
+        self._closed = True
+
+    def __enter__(self) -> TraceData:
+        self._ensure_open()
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        del exception
+        self.close()
 
     def list_sessions(self) -> tuple[SessionDTO, ...]:
+        self._ensure_open()
         sessions = self._database.scalars(
             select(ExecutionSession).order_by(ExecutionSession.created_at)
         ).all()
@@ -222,6 +332,109 @@ class TraceData:
             code_content=definition.code_content,
             first_line_number=definition.first_line_number,
             created_at=definition.created_at,
+        )
+
+    def list_function_calls(self) -> tuple[FunctionCallDTO, ...]:
+        """Return all observed VM calls in chronological order."""
+
+        self._ensure_open()
+        calls = self._database.scalars(
+            select(FunctionCall).order_by(FunctionCall.started_at, FunctionCall.id)
+        ).all()
+        return tuple(self._call_to_dto(call) for call in calls)
+
+    def list_callee_calls(self, call_id: int) -> tuple[FunctionCallDTO, ...]:
+        """Return direct VM children of a function call."""
+
+        self.get_function_call(call_id)
+        calls = self._database.scalars(
+            select(FunctionCall)
+            .where(FunctionCall.caller_call_id == call_id)
+            .order_by(FunctionCall.started_at, FunctionCall.id)
+        ).all()
+        return tuple(self._call_to_dto(call) for call in calls)
+
+    def list_stack_snapshots(
+        self,
+        call_id: int | None = None,
+    ) -> tuple[StackSnapshotDTO, ...]:
+        """Return line snapshots, optionally restricted to one call."""
+
+        self._ensure_open()
+        statement = select(StackSnapshot)
+        if call_id is not None:
+            self.get_function_call(call_id)
+            statement = statement.where(StackSnapshot.function_call_id == call_id)
+        snapshots = self._database.scalars(
+            statement.order_by(StackSnapshot.captured_at, StackSnapshot.id)
+        ).all()
+        return tuple(self._snapshot_to_dto(snapshot) for snapshot in snapshots)
+
+    def list_code_definitions(self) -> tuple[CodeDefinitionDTO, ...]:
+        """Return stored source definitions in creation order."""
+
+        self._ensure_open()
+        definitions = self._database.scalars(
+            select(CodeDefinition).order_by(
+                CodeDefinition.created_at,
+                CodeDefinition.id,
+            )
+        ).all()
+        return tuple(
+            CodeDefinitionDTO(
+                id=definition.id,
+                name=definition.name,
+                qualified_name=definition.qualified_name,
+                kind=definition.kind,
+                module_path=definition.module_path,
+                code_content=definition.code_content,
+                first_line_number=definition.first_line_number,
+                created_at=definition.created_at,
+            )
+            for definition in definitions
+        )
+
+    def list_stored_values(self) -> tuple[StoredValueSummaryDTO, ...]:
+        """List stored object versions without deserializing their values."""
+
+        self._ensure_open()
+        stored_values = self._database.scalars(
+            select(StoredObject).order_by(
+                StoredObject.identity_id,
+                StoredObject.version_number,
+            )
+        ).all()
+        return tuple(
+            StoredValueSummaryDTO(
+                reference=stored.id,
+                identity_id=stored.identity_id,
+                version=stored.version_number,
+                type_name=stored.type_name,
+                is_primitive=stored.is_primitive,
+            )
+            for stored in stored_values
+        )
+
+    def get_statistics(self) -> TraceStatisticsDTO:
+        """Return inexpensive entity counts for service and explorer clients."""
+
+        self._ensure_open()
+
+        def count(model: type[Any]) -> int:
+            return int(
+                self._database.scalar(select(func.count()).select_from(model)) or 0
+            )
+
+        return TraceStatisticsDTO(
+            session_count=count(ExecutionSession),
+            branch_count=count(ExecutionBranch),
+            step_count=count(ExecutionStep),
+            function_call_count=count(FunctionCall),
+            stack_snapshot_count=count(StackSnapshot),
+            external_interaction_count=count(ExternalInteractionOccurrence),
+            object_identity_count=count(ObjectIdentity),
+            stored_value_count=count(StoredObject),
+            code_definition_count=count(CodeDefinition),
         )
 
     def get_stored_value(self, reference: str) -> StoredValueDTO:
@@ -471,6 +684,7 @@ class TraceData:
         return self._serializer.loads(stored.pickle_data)
 
     def _require(self, model: type[Any], identifier: Any, label: str) -> Any:
+        self._ensure_open()
         value = self._database.get(model, identifier)
         if value is None:
             raise TraceNotFoundError(f"No {label} with id {identifier!r}")
@@ -481,6 +695,10 @@ class TraceData:
         if value.id is None:
             raise TraceConsistencyError(f"Unpersisted {label} has no id")
         return value.id
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise TraceDataError("This trace-data reader is closed")
 
 
 __all__ = [
@@ -493,8 +711,10 @@ __all__ = [
     "StackSnapshotDTO",
     "StepDTO",
     "StoredValueDTO",
+    "StoredValueSummaryDTO",
     "TraceConsistencyError",
     "TraceData",
     "TraceDataError",
     "TraceNotFoundError",
+    "TraceStatisticsDTO",
 ]

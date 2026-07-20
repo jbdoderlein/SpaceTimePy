@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}SpaceTimePy · Stack Timeline {{ call_id }}{% endblock %}
+{% block content %}
+<div class="row"><div><h1 id="name">Stack Timeline</h1><p id="meta" class="muted"></p></div><span class="grow"></span><button id="play">▶ Play</button></div>
+<section class="card"><div class="card-header">Snapshots <span id="position" class="badge"></span></div><div class="card-body"><input id="slider" type="range" min="0" value="0" style="width:100%"><div id="timeline" class="timeline"></div></div></section>
+<div class="grid two" style="margin-top:16px"><section class="card"><div class="card-header">Source · line <span id="line"></span></div><div class="card-body"><pre id="source" class="code">Loading…</pre></div></section><div class="stack"><section class="card"><div class="card-header">Locals</div><div id="locals" class="card-body"></div></section><section class="card"><div class="card-header">Globals</div><div id="globals" class="card-body"></div></section></div></div>
+{% endblock %}
+{% block scripts %}
+<script>
+  const callId={{ call_id|tojson }}; let recording=null,index=0,timer=null;
+  const slider=document.getElementById('slider'), timeline=document.getElementById('timeline');
+  function codeFor(frame){return recording.code_definitions[String(frame.code_definition_id)] || recording.function.code || null;}
+  function renderSource(frame){const code=codeFor(frame); if(!code){source.textContent='Source unavailable';return;} const first=code.first_line_no??1; source.innerHTML=String(code.content||'').split('\n').map((text,offset)=>{const number=first+offset;return `<span class="code-line ${number===frame.line?'active':''}"><span class="line-number">${number}</span>${escapeHtml(text)}</span>`;}).join(''); source.querySelector('.active')?.scrollIntoView({block:'center'});}
+  function select(next){if(!recording?.frames.length)return; index=Math.max(0,Math.min(next,recording.frames.length-1)); const frame=recording.frames[index]; slider.value=index; document.getElementById('position').textContent=`${index+1} / ${recording.frames.length}`; document.getElementById('line').textContent=frame.line; timeline.querySelectorAll('button').forEach((button,i)=>button.classList.toggle('active',i===index)); renderSource(frame); document.getElementById('locals').innerHTML=variableTable(frame.locals); document.getElementById('globals').innerHTML=variableTable(frame.globals);}
+  function stop(){clearInterval(timer);timer=null;document.getElementById('play').textContent='▶ Play';}
+  document.getElementById('play').onclick=()=>{if(timer){stop();return;}document.getElementById('play').textContent='■ Stop';timer=setInterval(()=>{if(index+1>=recording.frames.length){stop();return;}select(index+1);},600);}; slider.oninput=()=>select(Number(slider.value));
+  fetchJson(`/api/stack-recording/${callId}`).then(data=>{recording=data; document.getElementById('name').textContent=data.function.qualified_name||data.function.function; document.getElementById('meta').textContent=`${data.function.file||''}:${data.function.line??'?'} · ${data.frames.length} snapshots`; slider.max=Math.max(0,data.frames.length-1); timeline.innerHTML=data.frames.map((frame,i)=>`<button title="Line ${frame.line}" data-index="${i}">${frame.line}</button>`).join(''); timeline.querySelectorAll('button').forEach(button=>button.onclick=()=>select(Number(button.dataset.index))); if(data.frames.length)select(0);else{source.textContent='This call has no line snapshots.';document.getElementById('locals').innerHTML='<p class="muted">No snapshots.</p>';}}).catch(error=>source.textContent=error.message);
+</script>
+{% endblock %}

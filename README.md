@@ -36,6 +36,57 @@ JSON metadata through `space.capture.annotate_session(...)` and
 `space.capture.annotate_branch(...)`; trace consumers receive it through the
 corresponding public DTO attributes.
 
+## JSON API and web explorer
+
+Run the combined v2 API and browser explorer for an existing trusted trace:
+
+```bash
+web-spacetimepy trace.db
+```
+
+It serves the explorer at `http://127.0.0.1:8000`, JSON endpoints under
+`/api`, and generated OpenAPI documentation at `/docs`. Use `--api-only` when
+only the transport API is needed, or `--host` and `--port` to change the bind
+address.
+
+The explorer currently provides:
+
+- session and replay-branch navigation
+- resolved and branch-local step sequences
+- function-call search and captured entry/return state
+- line-level stack timelines with stored source versions
+- snapshots, VM call trees, and contiguous trace parts
+- a graph of sessions, branches, VM observations, code, and stored values
+
+Cross-trace comparison is intentionally not part of this version.
+
+Applications can create either surface from an open runtime, a public
+`TraceData` reader, or a database path:
+
+```python
+import spacetimepy
+
+api = spacetimepy.create_api_app("trace.db")
+explorer = spacetimepy.create_explorer_app("trace.db")
+
+# Or expose a currently open runtime in a background thread.
+server = spacetimepy.start_api(space, port=3456)
+server.stop()
+```
+
+For direct offline Python access without initializing VM monitoring:
+
+```python
+with spacetimepy.TraceData.open("trace.db") as trace:
+    sessions = trace.list_sessions()
+    calls = trace.list_function_calls()
+    statistics = trace.get_statistics()
+```
+
+Opening stored values may execute pickle data. Only explore databases you
+trust, and supply the same custom pickler providers used during capture when
+their classes are needed.
+
 ## Capture hooks
 
 Start and return hooks can derive JSON metadata from a captured invocation.

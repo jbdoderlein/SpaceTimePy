@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}SpaceTimePy · Function Call {{ call_id }}{% endblock %}
+{% block content %}<div id="content"><p class="muted">Loading call…</p></div>{% endblock %}
+{% block scripts %}
+<script>
+  const callId={{ call_id|tojson }};
+  fetchJson(`/api/function-call/${callId}`).then(result=>{const call=result.function_call; document.getElementById('content').innerHTML=`
+    <div class="row"><h1 style="margin:0">${escapeHtml(call.qualified_name||call.function)}</h1><span class="badge ${call.outcome==='returned'?'ok':''}">${escapeHtml(call.outcome)}</span></div>
+    <p class="muted">${escapeHtml(call.file||'unknown file')}:${call.line??'?'} · ${escapeHtml(call.start_time||'')}</p>
+    <div class="row">${call.prev_call?`<a class="button" href="/function-call/${call.prev_call}">← Previous</a>`:''}${call.next_call?`<a class="button" href="/function-call/${call.next_call}">Next →</a>`:''}${call.has_stack_recording?`<a class="button primary" href="/stack-recording/${call.id}">Open stack timeline</a>`:''}</div>
+    <div class="grid two" style="margin-top:16px"><section class="card"><div class="card-header">Locals</div><div class="card-body">${variableTable(call.locals)}</div></section><section class="card"><div class="card-header">Globals</div><div class="card-body">${variableTable(call.globals)}</div></section></div>
+    <div class="grid two" style="margin-top:16px"><section class="card"><div class="card-header">Return</div><div class="card-body">${variableTable({return:call.return_value})}</div></section><section class="card"><div class="card-header">Attributes</div><div class="card-body"><pre>${escapeHtml(JSON.stringify(call.attributes,null,2))}</pre></div></section></div>`;
+  }).catch(error=>document.getElementById('content').innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`);
+</script>
+{% endblock %}
