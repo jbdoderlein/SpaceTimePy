@@ -7,9 +7,12 @@ from collections import Counter, defaultdict
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from spacetimepy.interface.alignment import AlignmentService
+
 if TYPE_CHECKING:
     import datetime
 
+    from spacetimepy.interface.alignment import AlignmentResult
     from spacetimepy.interface.data import (
         BranchDTO,
         CodeDefinitionDTO,
@@ -65,10 +68,7 @@ def _preview(value: Any, *, depth: int = 0) -> Any:
         return result
     if isinstance(value, dict):
         items = list(value.items())
-        result = {
-            str(key): _preview(item, depth=depth + 1)
-            for key, item in items[:20]
-        }
+        result = {str(key): _preview(item, depth=depth + 1) for key, item in items[:20]}
         if len(items) > 20:
             result["..."] = f"{len(items) - 20} more"
         return result
@@ -82,8 +82,13 @@ def _preview(value: Any, *, depth: int = 0) -> Any:
 class TraceService:
     """Explore one trace through public DTOs and safe presentation payloads."""
 
-    def __init__(self, data: TraceData) -> None:
+    def __init__(
+        self,
+        data: TraceData,
+        alignment: AlignmentService | None = None,
+    ) -> None:
         self.data = data
+        self.alignment = alignment or AlignmentService(data)
         self._lock = RLock()
 
     def refresh(self) -> dict[str, bool]:
@@ -116,34 +121,80 @@ class TraceService:
         with self._lock:
             session = self.data.get_session(session_id)
             branches = [self.data.get_branch(item.id) for item in session.branches]
+            call_ids: list[int] = []
+            for branch in branches:
+                call_ids.extend(self._step_call_ids(branch.steps))
+            unique_call_ids = tuple(dict.fromkeys(call_ids))
+            calls = [
+                self.data.get_function_call(call_id) for call_id in unique_call_ids
+            ]
+            function_counts = Counter(call.function_name for call in calls)
 
-        call_ids: list[int] = []
-        for branch in branches:
-            call_ids.extend(self._step_call_ids(branch.steps))
-        unique_call_ids = tuple(dict.fromkeys(call_ids))
-        calls = [self.data.get_function_call(call_id) for call_id in unique_call_ids]
-        function_counts = Counter(call.function_name for call in calls)
-
-        return {
-            **self._session_summary(session),
-            "attributes": session.attributes,
-            "metadata": session.attributes,
-            "branches": [self._branch_summary(branch) for branch in branches],
-            "function_calls": [self._call_payload(call) for call in calls],
-            "function_call_ids": list(unique_call_ids),
-            "function_count": dict(function_counts),
-            "common_variables": self._common_variables(calls),
-        }
+            return {
+                **self._session_summary(session),
+                "attributes": session.attributes,
+                "metadata": session.attributes,
+                "branches": [self._branch_summary(branch) for branch in branches],
+                "function_calls": [self._call_payload(call) for call in calls],
+                "function_call_ids": list(unique_call_ids),
+                "function_count": dict(function_counts),
+                "common_variables": self._common_variables(calls),
+            }
 
     def branch(self, branch_id: int, *, resolve: bool = False) -> dict[str, Any]:
         with self._lock:
             branch = self.data.get_branch(branch_id, resolve=resolve)
-        return self._branch_payload(branch)
+            return self._branch_payload(branch)
 
     def step(self, step_id: int) -> dict[str, Any]:
         with self._lock:
             step = self.data.get_step(step_id)
-        return self._step_payload(step, include_values=True)
+            return self._step_payload(step, include_values=True)
+
+    def code_definition(self, definition_id: str) -> dict[str, Any]:
+        """Return one stored source definition for on-demand code views."""
+
+        with self._lock:
+            definition = self.data.get_code_definition(definition_id)
+        return {"code_definition": self._code_payload(definition)}
+
+    def alignment_algorithms(self) -> dict[str, Any]:
+        algorithms = self.alignment.registry.algorithms()
+        return {
+            "algorithms": [
+                {
+                    "name": algorithm.name,
+                    "version": algorithm.version,
+                    "offline": algorithm.offline,
+                    "online": algorithm.online,
+                }
+                for algorithm in algorithms
+            ]
+        }
+
+    def compare_alignment(
+        self,
+        *,
+        reference_branch_id: int,
+        target_branch_id: int,
+        algorithm: str | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Calculate and serialize one alignment without retaining it."""
+
+        with self._lock:
+            result = self.alignment.compare(
+                reference_branch_id=reference_branch_id,
+                target_branch_id=target_branch_id,
+                algorithm=algorithm,
+                options=options,
+            )
+        if result is None:
+            raise ValueError(
+                "No default alignment exists for this trace granularity; "
+                "select an algorithm"
+            )
+        return {"alignment": self._alignment_payload(result)}
 
     def function_calls(
         self,
@@ -206,83 +257,87 @@ class TraceService:
             snapshots = self.data.list_stack_snapshots(call_id)
             calls = self.data.list_function_calls()
             locations = self._call_locations().get(call_id, ())
-
-        call_index = next(
-            (index for index, candidate in enumerate(calls) if candidate.id == call_id),
-            None,
-        )
-        payload = self._call_payload(call)
-        payload.update(
-            {
-                "has_stack_recording": bool(snapshots),
-                "stack_recording": [
-                    self._snapshot_summary(snapshot) for snapshot in snapshots
-                ],
-                "locations": [self._location_payload(item) for item in locations],
-                "prev_call": (
-                    calls[call_index - 1].id
-                    if call_index is not None and call_index > 0
-                    else None
+            call_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(calls)
+                    if candidate.id == call_id
                 ),
-                "next_call": (
-                    calls[call_index + 1].id
-                    if call_index is not None and call_index + 1 < len(calls)
-                    else None
-                ),
-            }
-        )
-        return {"function_call": payload}
+                None,
+            )
+            payload = self._call_payload(call)
+            payload.update(
+                {
+                    "has_stack_recording": bool(snapshots),
+                    "stack_recording": [
+                        self._snapshot_summary(snapshot) for snapshot in snapshots
+                    ],
+                    "locations": [self._location_payload(item) for item in locations],
+                    "prev_call": (
+                        calls[call_index - 1].id
+                        if call_index is not None and call_index > 0
+                        else None
+                    ),
+                    "next_call": (
+                        calls[call_index + 1].id
+                        if call_index is not None and call_index + 1 < len(calls)
+                        else None
+                    ),
+                }
+            )
+            return {"function_call": payload}
 
     def stack_recording(self, call_id: int) -> dict[str, Any]:
         with self._lock:
             call = self.data.get_function_call(call_id)
             snapshots = self.data.list_stack_snapshots(call_id)
+            definition_ids = {
+                identifier
+                for identifier in [
+                    call.code_definition_id,
+                    *[snapshot.code_definition_id for snapshot in snapshots],
+                ]
+                if identifier is not None
+            }
+            definitions = {
+                identifier: self._code_payload(
+                    self.data.get_code_definition(identifier)
+                )
+                for identifier in definition_ids
+            }
+            frames = []
+            for position, snapshot in enumerate(snapshots):
+                frame = self._snapshot_payload(snapshot)
+                frame.update(
+                    {
+                        "position": position,
+                        "snapshot_id": snapshot.id,
+                        "previous_snapshot_id": (
+                            snapshots[position - 1].id if position > 0 else None
+                        ),
+                        "next_snapshot_id": (
+                            snapshots[position + 1].id
+                            if position + 1 < len(snapshots)
+                            else None
+                        ),
+                    }
+                )
+                frames.append(frame)
 
-        definition_ids = {
-            identifier
-            for identifier in [
-                call.code_definition_id,
-                *[snapshot.code_definition_id for snapshot in snapshots],
-            ]
-            if identifier is not None
-        }
-        definitions = {
-            identifier: self._code_payload(self.data.get_code_definition(identifier))
-            for identifier in definition_ids
-        }
-        frames = []
-        for position, snapshot in enumerate(snapshots):
-            frame = self._snapshot_payload(snapshot)
-            frame.update(
-                {
-                    "position": position,
-                    "snapshot_id": snapshot.id,
-                    "previous_snapshot_id": (
-                        snapshots[position - 1].id if position > 0 else None
-                    ),
-                    "next_snapshot_id": (
-                        snapshots[position + 1].id
-                        if position + 1 < len(snapshots)
-                        else None
-                    ),
-                }
-            )
-            frames.append(frame)
-
-        code = definitions.get(call.code_definition_id)
-        return {
-            "function": {
-                **self._call_summary(call, snapshot_count=len(snapshots)),
-                "code": code,
-            },
-            "code_definitions": definitions,
-            "frames": frames,
-        }
+            code = definitions.get(call.code_definition_id)
+            return {
+                "function": {
+                    **self._call_summary(call, snapshot_count=len(snapshots)),
+                    "code": code,
+                },
+                "code_definitions": definitions,
+                "frames": frames,
+            }
 
     def snapshot(self, snapshot_id: int) -> dict[str, Any]:
         with self._lock:
             snapshot = self.data.get_stack_snapshot(snapshot_id)
-        return {"snapshot": self._snapshot_payload(snapshot)}
+            return {"snapshot": self._snapshot_payload(snapshot)}
 
     def execution_tree(self, call_id: int, *, max_depth: int = 5) -> dict[str, Any]:
         with self._lock:
@@ -295,9 +350,8 @@ class TraceService:
                 return {
                     **self._call_summary(call),
                     "children": [build(child, depth + 1) for child in children],
-                    "truncated": depth >= max_depth and bool(
-                        self.data.list_callee_calls(call.id)
-                    ),
+                    "truncated": depth >= max_depth
+                    and bool(self.data.list_callee_calls(call.id)),
                 }
 
             tree = build(root, 0)
@@ -362,6 +416,7 @@ class TraceService:
             snapshots = self.data.list_stack_snapshots()
             definitions = self.data.list_code_definitions()
             stored_values = self.data.list_stored_values()
+            calls_by_id = {call.id: call for call in calls}
 
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[list[Any]] = []
@@ -375,7 +430,11 @@ class TraceService:
                 edges.append([source, target, {"type": kind, "label": label}])
 
         for session in sessions:
-            node(f"session:{session.id}", type="session", label=session.name or f"Session {session.id}")
+            node(
+                f"session:{session.id}",
+                type="session",
+                label=session.name or f"Session {session.id}",
+            )
         for branch in branches:
             branch_id = f"branch:{branch.id}"
             node(branch_id, type="branch", label=branch.name or f"Branch {branch.id}")
@@ -386,9 +445,19 @@ class TraceService:
                 step_id = f"step:{step.id}"
                 node(step_id, type="step", label=step.label or f"Step {step.position}")
                 edge(branch_id, step_id, "contains")
-                call = self._step_call(step)
+                call = (
+                    step.function_call
+                    if step.function_call is not None
+                    else calls_by_id.get(step.stack_snapshot.function_call_id)
+                    if step.stack_snapshot is not None
+                    else None
+                )
                 if call is not None:
-                    node(f"call:{call.id}", type="function_call", label=call.function_name)
+                    node(
+                        f"call:{call.id}",
+                        type="function_call",
+                        label=call.function_name,
+                    )
                     edge(step_id, f"call:{call.id}", "observes")
                 if step.stack_snapshot is not None:
                     snapshot_id = f"snapshot:{step.stack_snapshot.id}"
@@ -400,7 +469,11 @@ class TraceService:
                     edge(step_id, snapshot_id, "observes")
                 for occurrence in step.external_interactions:
                     external = occurrence.call
-                    node(f"call:{external.id}", type="external_call", label=external.function_name)
+                    node(
+                        f"call:{external.id}",
+                        type="external_call",
+                        label=external.function_name,
+                    )
                     edge(step_id, f"call:{external.id}", "external")
 
         for definition in definitions:
@@ -439,9 +512,7 @@ class TraceService:
 
         if not show_isolated:
             connected = {
-                endpoint
-                for graph_edge in edges
-                for endpoint in graph_edge[:2]
+                endpoint for graph_edge in edges for endpoint in graph_edge[:2]
             }
             nodes = {
                 identifier: data
@@ -499,6 +570,29 @@ class TraceService:
             "steps": [self._step_payload(step) for step in branch.steps],
         }
 
+    @staticmethod
+    def _alignment_payload(result: AlignmentResult) -> dict[str, Any]:
+        return {
+            "algorithm": result.algorithm,
+            "algorithm_version": result.algorithm_version,
+            "reference_branch_id": result.reference_branch_id,
+            "target_branch_id": result.target_branch_id,
+            "links": [
+                {
+                    "reference_step_id": (
+                        link.reference_step.id
+                        if link.reference_step is not None
+                        else None
+                    ),
+                    "target_step_id": (
+                        link.target_step.id if link.target_step is not None else None
+                    ),
+                    "relation": link.relation.value,
+                }
+                for link in result.links
+            ],
+        }
+
     def _step_payload(
         self,
         step: StepDTO,
@@ -540,9 +634,7 @@ class TraceService:
                     filter_dunder=True,
                 )
             elif call is not None:
-                payload["locals"] = self._reference_mapping(
-                    call.entry_local_references
-                )
+                payload["locals"] = self._reference_mapping(call.entry_local_references)
                 payload["globals"] = self._reference_mapping(
                     call.entry_global_references,
                     filter_dunder=True,
@@ -647,8 +739,7 @@ class TraceService:
         return {
             name: self._reference_payload(reference)
             for name, reference in references.items()
-            if not filter_dunder
-            or not (name.startswith("__") and name.endswith("__"))
+            if not filter_dunder or not (name.startswith("__") and name.endswith("__"))
         }
 
     def _reference_payload(self, reference: str | None) -> dict[str, Any]:

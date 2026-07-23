@@ -13,6 +13,26 @@ from spacetimepy.core.serialization import (
     SerializationError,
 )
 
+from .alignment import (
+    AlignmentAlgorithmDescriptor,
+    AlignmentAlgorithmNotFoundError,
+    AlignmentData,
+    AlignmentError,
+    AlignmentLink,
+    AlignmentRegistry,
+    AlignmentRelation,
+    AlignmentResult,
+    AlignmentService,
+    AlignmentValidationError,
+    CodeDiffProvider,
+    CodeDiffProviderNotFoundError,
+    OfflineAlignmentAlgorithm,
+    OfflineAlignmentContext,
+    OnlineAlignmentAlgorithm,
+    OnlineAlignmentContext,
+    OnlineAlignmentRun,
+    OnlineAlignmentSession,
+)
 from .capture import (
     CaptureDeclaration,
     CaptureInterface,
@@ -51,6 +71,7 @@ from .mcp.service import AgentTraceService
 from .replay import (
     ExternalInteractionScript,
     RecordedExternalInteraction,
+    ReplayAlignmentPolicy,
     ReplayContext,
     ReplayDivergenceError,
     ReplayError,
@@ -58,6 +79,15 @@ from .replay import (
     ReplayResult,
 )
 from .runtime import SpaceTime, get_active_spacetime, open_spacetime
+from .stack_snapshot_alignment import (
+    STACK_SNAPSHOT_ALIGNMENT,
+    STACK_SNAPSHOT_ALIGNMENT_VERSION,
+    CodeDiffLineMapper,
+    CodeDiffLineMappingError,
+    CodeLineCorrespondence,
+    CodeLineMapping,
+    StackSnapshotAlignment,
+)
 
 
 def create_api_app(*args, **kwargs):
@@ -118,6 +148,16 @@ def run_mcp(*args, **kwargs):
 
 __all__ = [
     "AgentTraceService",
+    "AlignmentAlgorithmDescriptor",
+    "AlignmentAlgorithmNotFoundError",
+    "AlignmentData",
+    "AlignmentError",
+    "AlignmentLink",
+    "AlignmentRegistry",
+    "AlignmentRelation",
+    "AlignmentResult",
+    "AlignmentService",
+    "AlignmentValidationError",
     "BranchDTO",
     "BranchSummaryDTO",
     "CaptureDeclaration",
@@ -127,6 +167,12 @@ __all__ = [
     "CaptureReturnContext",
     "CaptureStartContext",
     "CodeDefinitionDTO",
+    "CodeDiffLineMapper",
+    "CodeDiffLineMappingError",
+    "CodeDiffProvider",
+    "CodeDiffProviderNotFoundError",
+    "CodeLineCorrespondence",
+    "CodeLineMapping",
     "CustomPickler",
     "CustomPicklerError",
     "CustomPicklerProvider",
@@ -134,12 +180,19 @@ __all__ = [
     "ExternalInteractionDTO",
     "ExternalInteractionScript",
     "FunctionCallDTO",
+    "OfflineAlignmentAlgorithm",
+    "OfflineAlignmentContext",
+    "OnlineAlignmentAlgorithm",
+    "OnlineAlignmentContext",
+    "OnlineAlignmentRun",
+    "OnlineAlignmentSession",
     "RecordedExternalInteraction",
     "RecordingHandle",
     "ReturnHook",
     "ReplayContext",
     "ReplayDivergenceError",
     "ReplayError",
+    "ReplayAlignmentPolicy",
     "ReplayInterface",
     "ReplayResult",
     "Reducer",
@@ -147,6 +200,7 @@ __all__ = [
     "SerializationError",
     "SpaceTime",
     "StackSnapshotDTO",
+    "StackSnapshotAlignment",
     "StepDTO",
     "StoredValueDTO",
     "StoredValueSummaryDTO",
@@ -156,6 +210,8 @@ __all__ = [
     "TraceDataError",
     "TraceNotFoundError",
     "TraceStatisticsDTO",
+    "STACK_SNAPSHOT_ALIGNMENT",
+    "STACK_SNAPSHOT_ALIGNMENT_VERSION",
     "clear_capture_declarations",
     "create_api_app",
     "create_explorer_app",

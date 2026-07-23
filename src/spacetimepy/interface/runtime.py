@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from spacetimepy.core.model import Base
 from spacetimepy.core.monitoring import SpaceTimeMonitor
 from spacetimepy.core.serialization import CustomPickler, PickleSerializer
+from spacetimepy.interface.alignment import AlignmentService
 from spacetimepy.interface.capture import CaptureInterface, capture_registry
 from spacetimepy.interface.data import TraceData
 from spacetimepy.interface.replay import ReplayInterface
@@ -29,7 +30,7 @@ _active_runtime: SpaceTime | None = None
 
 
 class SpaceTime:
-    """Own one database unit of work and the three public interfaces.
+    """Own one database unit of work and the four public interfaces.
 
     Use :meth:`open` for the usual SQLite-backed runtime or
     :meth:`from_session` when an application already controls SQLAlchemy.
@@ -65,8 +66,8 @@ class SpaceTime:
         self._closed = False
 
         self._monitor = SpaceTimeMonitor(database, **monitor_options)
-        self._standard_external_interactions = (
-            StandardExternalInteractionRegistry(self._monitor)
+        self._standard_external_interactions = StandardExternalInteractionRegistry(
+            self._monitor
         )
         try:
             self._standard_external_interactions.start()
@@ -76,7 +77,13 @@ class SpaceTime:
                 self._standard_external_interactions,
             )
             self.data = TraceData(database, self._serializer)
-            self.replay = ReplayInterface(database, self._monitor, self.data)
+            self.alignment = AlignmentService(self.data)
+            self.replay = ReplayInterface(
+                database,
+                self._monitor,
+                self.data,
+                self.alignment,
+            )
             capture_registry.bind(self._monitor)
             _active_runtime = self
         except BaseException:
@@ -98,7 +105,10 @@ class SpaceTime:
         """Open a SQLite path/URL and create a complete SpaceTime runtime."""
 
         url = cls._database_url(database)
-        engine = create_engine(url, echo=echo)
+        engine_options: dict[str, Any] = {"echo": echo}
+        if url.startswith("sqlite"):
+            engine_options["connect_args"] = {"check_same_thread": False}
+        engine = create_engine(url, **engine_options)
         if create_schema:
             Base.metadata.create_all(engine)
         orm_session = Session(engine, expire_on_commit=False)

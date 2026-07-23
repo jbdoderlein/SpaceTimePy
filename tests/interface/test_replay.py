@@ -1,10 +1,51 @@
 from __future__ import annotations
 
 import inspect
+from typing import TYPE_CHECKING
 
-from spacetimepy import ReplayDivergenceError, ReplayError
+from spacetimepy import (
+    AlignmentLink,
+    AlignmentRelation,
+    ReplayAlignmentPolicy,
+    ReplayDivergenceError,
+    ReplayError,
+)
 from spacetimepy.core.monitoring import SpaceTimeMonitor
 from tests.support import SpaceTimeTestCase
+
+if TYPE_CHECKING:
+    from spacetimepy import OnlineAlignmentContext, StepDTO
+
+
+class _ReplayAlignmentSession:
+    def __init__(self, context: OnlineAlignmentContext) -> None:
+        self._reference_steps = context.reference_steps
+        self._position = 0
+
+    def align(self, target_step: StepDTO) -> tuple[AlignmentLink, ...]:
+        reference_step = self._reference_steps[self._position]
+        self._position += 1
+        return (
+            AlignmentLink(
+                reference_step,
+                target_step,
+                AlignmentRelation.MATCH,
+            ),
+        )
+
+    def finish(self) -> tuple[AlignmentLink, ...]:
+        return tuple(
+            AlignmentLink(step, None, AlignmentRelation.DELETED)
+            for step in self._reference_steps[self._position :]
+        )
+
+
+class _ReplayAlignment:
+    name = "replay-position"
+    version = "1"
+
+    def start(self, context: OnlineAlignmentContext) -> _ReplayAlignmentSession:
+        return _ReplayAlignmentSession(context)
 
 
 class TestReplayInterface(SpaceTimeTestCase):
@@ -313,6 +354,113 @@ class TestReplayInterface(SpaceTimeTestCase):
         self.assertEqual(result.value, 23)
         self.assertEqual(result.branch.status, "completed")
         self.assertEqual(result.branch.steps[0].source_step_id, source.id)
+
+    def test_default_replay_policy_does_not_use_alignment(self) -> None:
+        _, root, source, _ = self.record_external_step()
+
+        @self.space.capture.function
+        def changed(value: int) -> int:
+            return value + 20
+
+        result = self.space.replay.run(
+            lambda context: changed(context.locals["value"]),
+            parent_branch_id=root.id,
+            forked_from_step_id=source.id,
+        )
+
+        self.assertFalse(ReplayAlignmentPolicy().enabled)
+        self.assertIsNone(result.alignment)
+
+    def test_online_alignment_selects_external_interactions_for_each_step(
+        self,
+    ) -> None:
+        @self.space.capture.external
+        def read_external(value: int) -> int:
+            return value * 10
+
+        @self.space.capture.function
+        def original(value: int) -> int:
+            return read_external(value)
+
+        with self.space.capture.recording(name="root") as recording:
+            original(1)
+            original(2)
+        root = self.space.data.get_branch(recording.branch_id)
+
+        @self.space.capture.function
+        def changed(mocked_external) -> int:
+            return mocked_external(999)
+
+        def execute(context):
+            mocked = context.external.mock(read_external)
+            return changed(mocked), changed(mocked)
+
+        result = self.space.replay.run(
+            execute,
+            parent_branch_id=root.id,
+            forked_from_step_id=root.steps[0].id,
+            alignment_policy=ReplayAlignmentPolicy(
+                algorithm=_ReplayAlignment(),
+            ),
+            require_external_consumption=True,
+        )
+
+        self.assertEqual(result.value, (10, 20))
+        self.assertIsNotNone(result.alignment)
+        self.assertEqual(len(result.alignment.links), 2)
+        self.assertEqual(
+            result.alignment.reference_for(result.branch.steps[1]),
+            root.steps[1],
+        )
+
+    def test_online_alignment_resumes_an_outer_steps_external_script(
+        self,
+    ) -> None:
+        @self.space.capture.external
+        def read_external(value: int) -> int:
+            return value * 10
+
+        @self.space.capture.function
+        def original_inner() -> int:
+            return read_external(2)
+
+        @self.space.capture.function
+        def original_outer() -> tuple[int, int, int]:
+            before = read_external(1)
+            nested = original_inner()
+            after = read_external(3)
+            return before, nested, after
+
+        with self.space.capture.recording() as recording:
+            original_outer()
+        root = self.space.data.get_branch(recording.branch_id)
+
+        @self.space.capture.function
+        def changed_inner(mocked_external) -> int:
+            return mocked_external(200)
+
+        @self.space.capture.function
+        def changed_outer(mocked_external) -> tuple[int, int, int]:
+            before = mocked_external(100)
+            nested = changed_inner(mocked_external)
+            after = mocked_external(300)
+            return before, nested, after
+
+        def execute(context):
+            return changed_outer(context.external.mock(read_external))
+
+        result = self.space.replay.run(
+            execute,
+            parent_branch_id=root.id,
+            forked_from_step_id=root.steps[0].id,
+            alignment_policy=ReplayAlignmentPolicy(
+                algorithm=_ReplayAlignment(),
+            ),
+            require_external_consumption=True,
+        )
+
+        self.assertEqual(result.value, (10, 20, 30))
+        self.assertEqual(len(result.alignment.links), 2)
 
     def test_successful_replay_requires_a_real_replacement_step(self) -> None:
         _, root, source, _ = self.record_external_step()

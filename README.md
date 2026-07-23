@@ -70,6 +70,69 @@ branch is attached to the selected historical path. This operation can
 supersede an earlier active replacement context, enabling repeated interactive
 forks in one debug session.
 
+## Trace alignment
+
+Alignment is an optional service on the runtime. SpaceTimePy prepares the
+reference suffix from the child's fork step and supplies the existing public
+`BranchDTO` and `StepDTO` objects; the selected algorithm owns the matching
+semantics:
+
+```python
+import spacetimepy
+
+
+class MyAlignment:
+    name = "my-alignment"
+    version = "1"
+
+    def align(self, context):
+        return (
+            spacetimepy.AlignmentLink(
+                context.reference_steps[0],
+                context.target_steps[0],
+                spacetimepy.AlignmentRelation.MATCH,
+            ),
+        )
+
+
+space.alignment.register(
+    "my-alignment",
+    version="1",
+    offline=MyAlignment,
+)
+result = space.alignment.compare(
+    reference_branch_id=parent_branch_id,
+    target_branch_id=child_branch_id,
+    algorithm="my-alignment",
+)
+```
+
+Links use only `match`, `updated`, `inserted`, and `deleted`. Algorithms can
+load captured state with `context.data.values(step)`, stored source with
+`context.data.code(step)`, and the complete trace query service through
+`context.data.trace`. A code-diff implementation can be registered separately
+and requested lazily with `context.data.diff(reference_step, target_step)`.
+For stack-snapshot sessions, omitting `algorithm` selects the built-in
+`stack-snapshot` offline algorithm. It uses `code-diff` to map source lines,
+then aligns the chronological snapshots. Other granularities still require an
+explicit algorithm.
+
+Online algorithms implement `start(context)` and return a stateful session
+with `align(target_step)` and `finish()` methods. The same runtime service
+validates each incremental link. Replay uses no alignment by default. To opt
+in, pass `ReplayAlignmentPolicy(algorithm="registered-name")`; each target
+step is then aligned as it is recorded, and `context.external` selects the
+matched reference step's external interactions before the target step runs.
+The transient final alignment is available on `ReplayResult.alignment`.
+
+For a live runtime, the HTTP API exposes its registered implementations at
+`GET /api/alignment/algorithms` and calculates a transient result with
+`POST /api/alignment/compare`. The session page offers the same operation for
+related parent and child branches. Its comparison workspace displays the
+aligned traces above two synchronized source panes; selecting an aligned row
+highlights the corresponding line on each side. An API opened from a database
+path includes built-in algorithms but not process-local custom registrations.
+
 ## JSON API and web explorer
 
 Run the combined v2 API and browser explorer for an existing trusted trace:
@@ -89,10 +152,13 @@ The explorer currently provides:
 - resolved and branch-local step sequences
 - function-call search and captured entry/return state
 - line-level stack timelines with stored source versions
+- on-demand parent/fork alignment with side-by-side, syntax-highlighted source
 - snapshots, VM call trees, and contiguous trace parts
 - a graph of sessions, branches, VM observations, code, and stored values
 
-Cross-trace comparison is intentionally not part of this version.
+The explorer's read-only CodeMirror bundle is committed as a package asset.
+After changing `frontend/codemirror.js`, rebuild it with
+`npm ci && npm run build:web`.
 
 Applications can create either surface from an open runtime, a public
 `TraceData` reader, or a database path:

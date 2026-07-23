@@ -13,8 +13,9 @@ from tests.support import SpaceTimeTestCase
 
 
 class TestSpaceTimeRuntime(SpaceTimeTestCase):
-    def test_runtime_composes_the_three_public_services(self) -> None:
+    def test_runtime_composes_the_four_public_services(self) -> None:
         self.assertIs(self.space.capture._database, self.space.data._database)
+        self.assertIs(self.space.alignment.data.trace, self.space.data)
         self.assertIs(self.space.replay._data, self.space.data)
         self.assertFalse(self.space.is_closed)
         self.assertIs(get_active_spacetime(), self.space)

@@ -87,6 +87,7 @@ LineAttributes = Callable[
     ["SpaceTimeMonitor", types.FrameType, types.CodeType, int],
     Mapping[str, Any] | None,
 ]
+StepActivated = Callable[["SpaceTimeMonitor", ExecutionStep], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +179,7 @@ class SpaceTimeMonitor:
         self._next_external_positions: dict[int, int] = {}
         self._pending_events = 0
         self._inside_callback = False
+        self._step_activation_listeners: list[StepActivated] = []
 
         self._code_definition_cache: dict[types.CodeType, str | None] = {}
         self._known_code_definition_ids: set[str] = set()
@@ -204,6 +206,18 @@ class SpaceTimeMonitor:
         """Return the transient capture registrations currently installed."""
 
         return tuple(self._captures.values())
+
+    def add_step_activation_listener(self, listener: StepActivated) -> None:
+        """Observe newly active timeline steps until explicitly removed."""
+
+        if listener not in self._step_activation_listeners:
+            self._step_activation_listeners.append(listener)
+
+    def remove_step_activation_listener(self, listener: StepActivated) -> None:
+        """Stop observing active steps; missing listeners are ignored."""
+
+        if listener in self._step_activation_listeners:
+            self._step_activation_listeners.remove(listener)
 
     def register_capture(
         self,
@@ -758,6 +772,7 @@ class SpaceTimeMonitor:
 
         self._active_calls.clear()
         self._active_calls_by_frame.clear()
+        self._step_activation_listeners.clear()
         self.current_branch = None
         self.current_session = None
         self._initialized = False
@@ -854,6 +869,7 @@ class SpaceTimeMonitor:
                 function_call=function_call,
                 source_step=source_step,
             )
+            self._notify_step_activated(active.current_step)
         elif role == CallRole.EXTERNAL_INTERACTION:
             occurrence = ExternalInteractionOccurrence(
                 step=owner_step,
@@ -921,6 +937,7 @@ class SpaceTimeMonitor:
                 stack_snapshot=snapshot,
                 source_step=source_step,
             )
+            self._notify_step_activated(active.current_step)
 
         self._mark_event_recorded()
         return snapshot
@@ -1020,6 +1037,10 @@ class SpaceTimeMonitor:
         self._next_step_position += 1
         return step
 
+    def _notify_step_activated(self, step: ExecutionStep) -> None:
+        for listener in tuple(self._step_activation_listeners):
+            listener(self, step)
+
     def _take_external_position(self, step: ExecutionStep) -> int:
         step_key = id(step)
         if step_key not in self._next_external_positions:
@@ -1068,6 +1089,17 @@ class SpaceTimeMonitor:
     def _remove_active(self, active: _ActiveCall) -> None:
         self._active_calls.pop()
         self._active_calls_by_frame.pop(active.frame_id, None)
+        if active.role == CallRole.STEP:
+            resumed_step = next(
+                (
+                    candidate.current_step
+                    for candidate in reversed(self._active_calls)
+                    if candidate.current_step is not None
+                ),
+                None,
+            )
+            if resumed_step is not None:
+                self._notify_step_activated(resumed_step)
 
     def _merge_call_attributes(
         self,

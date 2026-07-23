@@ -1,9 +1,12 @@
 *.db
 *.json
+!package.json
+!package-lock.json
 *.backup
 .agents
 .codex
 .venv
+node_modules/
 
 # Python
 __pycache__/

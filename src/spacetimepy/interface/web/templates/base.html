@@ -9,11 +9,21 @@
       color-scheme: light dark;
       --bg: #f4f6f9; --panel: #fff; --panel2: #f8fafc; --text: #172033;
       --muted: #64748b; --line: #dbe2ea; --brand: #2563eb; --accent: #0f766e;
-      --danger: #b91c1c; --code: #111827; --code-text: #e5e7eb;
+      --danger: #b91c1c; --code:#f8fafc; --code-text:#172033;
+      --code-line-number:#94a3b8; --code-highlight:#dbeafe;
+      --code-highlight-text:#172033; --code-selection:#bfdbfe;
+      --syntax-keyword:#7c3aed; --syntax-name:#1e293b; --syntax-function:#0369a1;
+      --syntax-constant:#be185d; --syntax-definition:#075985; --syntax-type:#b45309;
+      --syntax-operator:#475569; --syntax-comment:#64748b; --syntax-string:#047857;
     }
     @media (prefers-color-scheme: dark) {
       :root { --bg:#0f172a; --panel:#172033; --panel2:#1e293b; --text:#e5e7eb;
-        --muted:#94a3b8; --line:#334155; --brand:#60a5fa; --accent:#2dd4bf; }
+        --muted:#94a3b8; --line:#334155; --brand:#60a5fa; --accent:#2dd4bf;
+        --code:#111827; --code-text:#e5e7eb; --code-line-number:#64748b;
+        --code-highlight:#6d28d9; --code-highlight-text:#fff; --code-selection:#334155;
+        --syntax-keyword:#c4b5fd; --syntax-name:#e2e8f0; --syntax-function:#7dd3fc;
+        --syntax-constant:#f9a8d4; --syntax-definition:#93c5fd; --syntax-type:#fdba74;
+        --syntax-operator:#cbd5e1; --syntax-comment:#94a3b8; --syntax-string:#6ee7b7; }
     }
     * { box-sizing: border-box; }
     body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif; }
@@ -46,7 +56,7 @@
     pre,code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
     pre.code { margin:0; padding:14px; overflow:auto; border-radius:8px; color:var(--code-text); background:var(--code); }
     .code-line { display:block; min-height:1.45em; padding:0 7px; white-space:pre; }
-    .code-line.active { color:white; background:#7c3aed; } .line-number { display:inline-block; width:48px; color:#94a3b8; user-select:none; }
+    .code-line.active { color:var(--code-highlight-text); background:var(--code-highlight); } .line-number { display:inline-block; width:48px; color:var(--code-line-number); user-select:none; }
     .kv { display:grid; grid-template-columns:minmax(120px,.35fr) 1fr; gap:1px; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
     .kv > * { padding:8px 10px; background:var(--panel2); overflow-wrap:anywhere; }
     .kv > :nth-child(odd) { color:var(--muted); font-weight:600; }

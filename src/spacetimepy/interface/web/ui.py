@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import Request  # noqa: TC002 - FastAPI inspects this annotation
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 if TYPE_CHECKING:
@@ -13,10 +14,13 @@ if TYPE_CHECKING:
 
 
 _templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+_static = Path(__file__).parent / "static"
 
 
 def register_ui_routes(application: FastAPI) -> None:
     """Attach explorer pages that consume the app's public JSON endpoints."""
+
+    application.mount("/static", StaticFiles(directory=_static), name="static")
 
     def page(request: Request, template: str, **context: Any) -> Any:
         return _templates.TemplateResponse(

@@ -1,0 +1,17 @@
+{
+  "name": "spacetimepy-web-assets",
+  "private": true,
+  "scripts": {
+    "build:web": "esbuild frontend/codemirror.js --bundle --minify --format=iife --global-name=SpaceTimeCodeMirror --outfile=src/spacetimepy/interface/web/static/codemirror.js"
+  },
+  "dependencies": {
+    "@codemirror/lang-python": "6.2.1",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.6",
+    "@lezer/highlight": "1.2.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}

@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
+from spacetimepy.interface.alignment import (
+    AlignmentAlgorithmNotFoundError,
+    AlignmentError,
+    AlignmentService,
+)
 from spacetimepy.interface.data import (
     TraceData,
     TraceDataError,
@@ -28,19 +34,29 @@ if TYPE_CHECKING:
 type TraceSource = TraceData | SpaceTime | str | Path
 
 
+class AlignmentComparisonRequest(BaseModel):
+    """One transient branch-alignment request."""
+
+    reference_branch_id: int
+    target_branch_id: int
+    algorithm: str | None = Field(default=None, min_length=1)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 def _open_source(
     source: TraceSource,
     custom_picklers: Iterable[CustomPickler],
-) -> tuple[TraceData, bool]:
+) -> tuple[TraceData, AlignmentService, bool]:
     if isinstance(source, SpaceTime):
         if source.is_closed:
             raise RuntimeError("The supplied SpaceTime runtime is closed")
-        return source.data, False
+        return source.data, source.alignment, False
     if isinstance(source, TraceData):
         if source.is_closed:
             raise RuntimeError("The supplied trace-data reader is closed")
-        return source, False
-    return TraceData.open(source, custom_picklers=custom_picklers), True
+        return source, AlignmentService(source), False
+    data = TraceData.open(source, custom_picklers=custom_picklers)
+    return data, AlignmentService(data), True
 
 
 def create_api_app(
@@ -50,8 +66,8 @@ def create_api_app(
 ) -> FastAPI:
     """Create the pure JSON API for a database, reader, or live runtime."""
 
-    data, owns_data = _open_source(source, custom_picklers)
-    service = TraceService(data)
+    data, alignment, owns_data = _open_source(source, custom_picklers)
+    service = TraceService(data, alignment)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -72,6 +88,7 @@ def create_api_app(
         lifespan=lifespan,
     )
     application.state.trace_service = service
+    application.state.alignment_service = alignment
     application.state.owns_trace_data = owns_data
     application.add_middleware(
         CORSMiddleware,
@@ -93,6 +110,23 @@ def create_api_app(
 
     @application.exception_handler(TraceDataError)
     async def trace_data_error(request: Request, error: TraceDataError) -> Any:
+        del request
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=409, content={"detail": str(error)})
+
+    @application.exception_handler(AlignmentAlgorithmNotFoundError)
+    async def alignment_algorithm_not_found(
+        request: Request,
+        error: AlignmentAlgorithmNotFoundError,
+    ) -> Any:
+        del request
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=404, content={"detail": str(error)})
+
+    @application.exception_handler(AlignmentError)
+    async def alignment_error(request: Request, error: AlignmentError) -> Any:
         del request
         from fastapi.responses import JSONResponse
 
@@ -123,6 +157,25 @@ def create_api_app(
     @application.get("/api/step/{step_id}", include_in_schema=False)
     def step(step_id: int) -> dict[str, Any]:
         return service.step(step_id)
+
+    @application.get("/api/code-definitions/{definition_id}")
+    def code_definition(definition_id: str) -> dict[str, Any]:
+        return service.code_definition(definition_id)
+
+    @application.get("/api/alignment/algorithms")
+    def alignment_algorithms() -> dict[str, Any]:
+        return service.alignment_algorithms()
+
+    @application.post("/api/alignment/compare")
+    def compare_alignment(
+        comparison: AlignmentComparisonRequest,
+    ) -> dict[str, Any]:
+        return service.compare_alignment(
+            reference_branch_id=comparison.reference_branch_id,
+            target_branch_id=comparison.target_branch_id,
+            algorithm=comparison.algorithm,
+            options=comparison.options,
+        )
 
     @application.get("/api/function-calls")
     def function_calls(
@@ -247,6 +300,7 @@ def start_api(
 
 
 __all__ = [
+    "AlignmentComparisonRequest",
     "ApiServerHandle",
     "TraceSource",
     "create_api_app",

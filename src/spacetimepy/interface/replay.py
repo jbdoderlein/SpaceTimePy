@@ -9,8 +9,9 @@ monitor records the new branch.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from spacetimepy.core.model import (
@@ -19,6 +20,13 @@ from spacetimepy.core.model import (
     ExecutionStep,
     FunctionCallOutcome,
     utc_now,
+)
+from spacetimepy.interface.alignment import (
+    AlignmentLink,
+    AlignmentRelation,
+    AlignmentResult,
+    AlignmentService,
+    OnlineAlignmentRun,
 )
 from spacetimepy.interface.data import (
     BranchDTO,
@@ -36,6 +44,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from spacetimepy.core.monitoring import SpaceTimeMonitor
+    from spacetimepy.interface.alignment import OnlineAlignmentAlgorithm
 
 
 ReplayValue = TypeVar("ReplayValue")
@@ -47,6 +56,28 @@ class ReplayError(RuntimeError):
 
 class ReplayDivergenceError(ReplayError):
     """Raised when replayed external calls differ from the recorded order."""
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayAlignmentPolicy:
+    """Select optional online alignment for one replay.
+
+    The default policy has no algorithm and leaves replay behavior unchanged.
+    """
+
+    algorithm: str | OnlineAlignmentAlgorithm | None = None
+    options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "options",
+            MappingProxyType(dict(self.options)),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.algorithm is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,26 +95,39 @@ class RecordedExternalInteraction:
         return self.occurrence.call.outcome
 
 
+@dataclass(slots=True)
+class _ExternalInteractionState:
+    interactions: tuple[RecordedExternalInteraction, ...]
+    position: int = 0
+    error: BaseException | None = None
+
+
 class ExternalInteractionScript:
     """Consume recorded external results in their original call order."""
 
     def __init__(
         self, interactions: tuple[RecordedExternalInteraction, ...]
     ) -> None:
-        self._interactions = interactions
-        self._position = 0
+        self._state = _ExternalInteractionState(interactions)
+        self._step_states: dict[int, _ExternalInteractionState] = {}
 
     @property
     def remaining(self) -> int:
-        return len(self._interactions) - self._position
+        return len(self._state.interactions) - self._state.position
 
     def peek(self) -> RecordedExternalInteraction | None:
-        if self._position >= len(self._interactions):
+        if self._state.position >= len(self._state.interactions):
             return None
-        return self._interactions[self._position]
+        return self._state.interactions[self._state.position]
 
     def take(self, target: Callable[..., Any] | str) -> Any:
         """Return/raise the next recorded outcome after validating its name."""
+
+        if self._state.error is not None:
+            raise ReplayDivergenceError(
+                "External interaction replay is unavailable because online "
+                "alignment failed"
+            ) from self._state.error
 
         interaction = self.peek()
         if interaction is None:
@@ -103,7 +147,7 @@ class ExternalInteractionScript:
                 f"{self._target_label(target)!r}"
             )
 
-        self._position += 1
+        self._state.position += 1
         if interaction.outcome == FunctionCallOutcome.RAISED.value:
             if isinstance(interaction.exception, BaseException):
                 raise interaction.exception
@@ -118,6 +162,32 @@ class ExternalInteractionScript:
             )
         return interaction.return_value
 
+    def select(
+        self,
+        interactions: tuple[RecordedExternalInteraction, ...],
+        *,
+        step_id: int | None = None,
+        require_consumed: bool = False,
+    ) -> None:
+        """Select the recorded interactions for the next aligned step."""
+
+        if require_consumed:
+            self.assert_consumed()
+        if step_id is None:
+            self._state = _ExternalInteractionState(interactions)
+            return
+        self._state = self._step_states.setdefault(
+            step_id,
+            _ExternalInteractionState(interactions),
+        )
+
+    def fail(self, error: BaseException) -> None:
+        """Prevent consumption after an online alignment failure."""
+
+        self._state.interactions = ()
+        self._state.position = 0
+        self._state.error = error
+
     def mock(self, target: Callable[..., Any]) -> Callable[..., Any]:
         """Build a simple replacement callable backed by this script."""
 
@@ -129,15 +199,36 @@ class ExternalInteractionScript:
         return replacement
 
     def assert_consumed(self) -> None:
-        if self.remaining:
-            interaction = self.peek()
+        states = (
+            tuple(self._step_states.values())
+            if self._step_states
+            else (self._state,)
+        )
+        for state in states:
+            if state.error is not None:
+                raise ReplayDivergenceError(
+                    "External interaction replay is unavailable because online "
+                    "alignment failed"
+                ) from state.error
+        remaining = sum(
+            len(state.interactions) - state.position for state in states
+        )
+        if remaining:
+            interaction = next(
+                (
+                    state.interactions[state.position]
+                    for state in states
+                    if state.position < len(state.interactions)
+                ),
+                None,
+            )
             name = (
                 interaction.occurrence.call.qualified_name
                 if interaction is not None
                 else None
             )
             raise ReplayDivergenceError(
-                f"Replay finished with {self.remaining} external interaction(s) "
+                f"Replay finished with {remaining} external interaction(s) "
                 f"remaining; next is {name!r}"
             )
 
@@ -191,12 +282,15 @@ class ReplayContext:
     external: ExternalInteractionScript
     recipe: dict[str, Any]
     options: dict[str, Any]
+    alignment_policy: ReplayAlignmentPolicy
+    alignment: AlignmentResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayResult:
     branch: BranchDTO
     value: Any
+    alignment: AlignmentResult | None = None
 
 
 class ReplayInterface:
@@ -207,11 +301,15 @@ class ReplayInterface:
         database: Session,
         monitor: SpaceTimeMonitor,
         data: TraceData,
+        alignment: AlignmentService | None = None,
     ) -> None:
         self._database = database
         self._monitor = monitor
         self._data = data
+        self._alignment_service = alignment or AlignmentService(data)
         self._active_context: ReplayContext | None = None
+        self._active_alignment: OnlineAlignmentRun | None = None
+        self._active_alignment_error: BaseException | None = None
 
     @property
     def active_session_id(self) -> int | None:
@@ -227,6 +325,7 @@ class ReplayInterface:
         forked_from_step_id: int,
         recipe: Mapping[str, Any] | None = None,
         options: Mapping[str, Any] | None = None,
+        alignment_policy: ReplayAlignmentPolicy | None = None,
     ) -> ReplayContext:
         """Materialize replay input without creating or recording a branch."""
 
@@ -240,6 +339,7 @@ class ReplayInterface:
             forked_from_step_id=forked_from_step_id,
             recipe=recipe,
             options=options,
+            alignment_policy=alignment_policy,
         )
 
     def begin(
@@ -252,6 +352,7 @@ class ReplayInterface:
         recipe: Mapping[str, Any] | None = None,
         attributes: Mapping[str, Any] | None = None,
         options: Mapping[str, Any] | None = None,
+        alignment_policy: ReplayAlignmentPolicy | None = None,
     ) -> ReplayContext:
         """Create a child branch and attach the monitor before execution."""
 
@@ -268,6 +369,7 @@ class ReplayInterface:
             forked_from_step_id=forked_from_step_id,
             recipe=recipe,
             options=options,
+            alignment_policy=alignment_policy,
         )
         branch = ExecutionBranch(
             session=parent.session,
@@ -288,7 +390,14 @@ class ReplayInterface:
             raise ReplayError("The database did not assign a replay branch ID")
 
         context.branch_id = branch.id
-        self._monitor.start_branch(branch)
+        try:
+            self._start_alignment(context)
+            self._monitor.start_branch(branch)
+        except BaseException:
+            self._discard_alignment()
+            self._database.delete(branch)
+            self._database.flush()
+            raise
         self._active_context = context
         return context
 
@@ -306,6 +415,7 @@ class ReplayInterface:
         recipe: Mapping[str, Any] | None = None,
         attributes: Mapping[str, Any] | None = None,
         options: Mapping[str, Any] | None = None,
+        alignment_policy: ReplayAlignmentPolicy | None = None,
     ) -> ReplayContext:
         """Fork an active recording while an integration replaces its frame.
 
@@ -365,6 +475,7 @@ class ReplayInterface:
             forked_from_step_id=selected_step_id,
             recipe=recipe,
             options=options,
+            alignment_policy=alignment_policy,
         )
         branch = ExecutionBranch(
             session=execution_session,
@@ -382,13 +493,22 @@ class ReplayInterface:
             raise ReplayError("The database did not assign an active replay branch ID")
 
         context.branch_id = branch.id
-        self._monitor.replace_active_execution(
-            branch,
-            source_frame=source_frame,
-            replacement_frame=replacement_frame,
-            replacement_target=replacement_target,
-            replacement_line_numbers=replacement_line_numbers,
-        )
+        if self._active_context is not None:
+            self._finish_alignment(self._active_context)
+        try:
+            self._start_alignment(context)
+            self._monitor.replace_active_execution(
+                branch,
+                source_frame=source_frame,
+                replacement_frame=replacement_frame,
+                replacement_target=replacement_target,
+                replacement_line_numbers=replacement_line_numbers,
+            )
+        except BaseException:
+            self._discard_alignment()
+            self._database.delete(branch)
+            self._database.flush()
+            raise
         self._active_context = context
         return context
 
@@ -437,6 +557,16 @@ class ReplayInterface:
             raise ReplayError("The active monitor branch is not this replay")
 
         selected_status = ExecutionStatus(status)
+        alignment_error: BaseException | None = None
+        if selected_status == ExecutionStatus.COMPLETED:
+            try:
+                self._finish_alignment(context)
+            except BaseException as error:
+                alignment_error = error
+                selected_status = ExecutionStatus.FAILED
+        else:
+            self._discard_alignment()
+
         self._monitor.finish_branch(selected_status, commit=False)
         execution_session.status = selected_status
         execution_session.completed_at = (
@@ -459,6 +589,8 @@ class ReplayInterface:
 
         if commit:
             self._database.commit()
+        if alignment_error is not None:
+            raise ReplayError("Online replay alignment failed") from alignment_error
         return self._data.get_branch(context.branch_id)
 
     @contextmanager
@@ -472,6 +604,7 @@ class ReplayInterface:
         recipe: Mapping[str, Any] | None = None,
         attributes: Mapping[str, Any] | None = None,
         options: Mapping[str, Any] | None = None,
+        alignment_policy: ReplayAlignmentPolicy | None = None,
         require_external_consumption: bool = False,
         commit: bool = True,
     ) -> Iterator[ReplayContext]:
@@ -485,6 +618,7 @@ class ReplayInterface:
             recipe=recipe,
             attributes=attributes,
             options=options,
+            alignment_policy=alignment_policy,
         )
         try:
             yield context
@@ -507,6 +641,7 @@ class ReplayInterface:
         recipe: Mapping[str, Any] | None = None,
         attributes: Mapping[str, Any] | None = None,
         options: Mapping[str, Any] | None = None,
+        alignment_policy: ReplayAlignmentPolicy | None = None,
         require_external_consumption: bool = False,
         commit: bool = True,
     ) -> ReplayResult:
@@ -522,6 +657,7 @@ class ReplayInterface:
             recipe=recipe,
             attributes=attributes,
             options=options,
+            alignment_policy=alignment_policy,
             require_external_consumption=require_external_consumption,
             commit=commit,
         ) as context:
@@ -530,6 +666,7 @@ class ReplayInterface:
         return ReplayResult(
             branch=self._data.get_branch(context.branch_id),
             value=value,
+            alignment=context.alignment,
         )
 
     def _build_context(
@@ -541,6 +678,7 @@ class ReplayInterface:
         forked_from_step_id: int,
         recipe: Mapping[str, Any] | None,
         options: Mapping[str, Any] | None,
+        alignment_policy: ReplayAlignmentPolicy | None,
     ) -> ReplayContext:
         source = self._data.get_step(forked_from_step_id)
         if source.stack_snapshot is not None:
@@ -580,6 +718,125 @@ class ReplayInterface:
             external=ExternalInteractionScript(interactions),
             recipe=dict(recipe or {}),
             options=dict(options or {}),
+            alignment_policy=alignment_policy or ReplayAlignmentPolicy(),
+        )
+
+    def _start_alignment(
+        self,
+        context: ReplayContext,
+    ) -> None:
+        policy = context.alignment_policy
+        if not policy.enabled:
+            return
+        self._active_alignment = self._alignment_service.start_online(
+            reference_branch_id=context.parent_branch_id,
+            target_branch_id=context.branch_id,
+            algorithm=policy.algorithm,
+            options=policy.options,
+        )
+        self._active_alignment_error = None
+        self._monitor.add_step_activation_listener(self._activate_recorded_step)
+
+    def _activate_recorded_step(
+        self,
+        monitor: SpaceTimeMonitor,
+        step: ExecutionStep,
+    ) -> None:
+        context = self._active_context
+        alignment = self._active_alignment
+        if context is None or alignment is None or step.branch.id != context.branch_id:
+            return
+
+        if self._active_alignment_error is not None:
+            context.external.fail(self._active_alignment_error)
+            return
+
+        try:
+            monitor.flush()
+            if step.id is None:
+                raise ReplayError("The new replay step has no persistent ID")
+            target_step = self._data.get_step(step.id)
+            link = alignment.link_for_target(target_step)
+            if link is None:
+                links = alignment.align(target_step)
+                target_links = tuple(
+                    candidate
+                    for candidate in links
+                    if candidate.target_step is not None
+                    and candidate.target_step.id == target_step.id
+                )
+                if len(target_links) != 1:
+                    raise ReplayDivergenceError(
+                        "An online replay algorithm must immediately return "
+                        "exactly one link for target step "
+                        f"{target_step.id}"
+                    )
+                link = target_links[0]
+            interactions = self._interactions_for_alignment_link(link)
+            context.external.select(
+                interactions,
+                step_id=target_step.id,
+            )
+            context.external_interactions = interactions
+        except BaseException as error:
+            self._active_alignment_error = error
+            context.external.fail(error)
+
+    def _finish_alignment(self, context: ReplayContext) -> None:
+        alignment = self._active_alignment
+        self._monitor.remove_step_activation_listener(
+            self._activate_recorded_step
+        )
+        try:
+            if alignment is None:
+                return
+            if self._active_alignment_error is not None:
+                raise self._active_alignment_error
+            self._monitor.flush()
+            alignment.finish()
+            context.alignment = alignment.result
+        finally:
+            self._clear_alignment_state()
+
+    def _discard_alignment(self) -> None:
+        self._monitor.remove_step_activation_listener(
+            self._activate_recorded_step
+        )
+        self._clear_alignment_state()
+
+    def _clear_alignment_state(self) -> None:
+        self._active_alignment = None
+        self._active_alignment_error = None
+
+    def _interactions_for_alignment_link(
+        self,
+        link: AlignmentLink,
+    ) -> tuple[RecordedExternalInteraction, ...]:
+        if link.relation == AlignmentRelation.INSERTED:
+            return ()
+        if link.reference_step is None:
+            raise ReplayDivergenceError(
+                f"{link.relation.value} link has no reference step"
+            )
+        return self._materialize_step_interactions(link.reference_step)
+
+    def _materialize_step_interactions(
+        self,
+        source: StepDTO,
+    ) -> tuple[RecordedExternalInteraction, ...]:
+        references: list[str] = []
+        for occurrence in source.external_interactions:
+            call = occurrence.call
+            references.extend(call.entry_local_references.values())
+            references.extend(call.entry_global_references.values())
+            if call.return_reference is not None:
+                references.append(call.return_reference)
+            if call.exception_reference is not None:
+                references.append(call.exception_reference)
+        loaded_values = self._data.load_values(references)
+        return tuple(
+            self._materialize_external(occurrence, loaded_values)
+            for occurrence in source.external_interactions
         )
 
     def _materialize_external(
@@ -650,6 +907,7 @@ class ReplayInterface:
 __all__ = [
     "ExternalInteractionScript",
     "RecordedExternalInteraction",
+    "ReplayAlignmentPolicy",
     "ReplayContext",
     "ReplayDivergenceError",
     "ReplayError",

@@ -1,11 +1,512 @@
 {% extends "base.html" %}
 {% block title %}SpaceTimePy · Session {{ session_id }}{% endblock %}
-{% block content %}<div id="header"><h1>Session {{ session_id }}</h1></div><div class="grid two"><section class="card"><div class="card-header">Branch Tree</div><div id="branches" class="card-body stack"></div></section><section class="card"><div class="card-header">Branch Steps</div><div id="steps" class="card-body"><p class="muted">Select a branch.</p></div></section></div>{% endblock %}
+{% block content %}
+<style>
+  .comparison-controls { display:grid; grid-template-columns:minmax(180px,1fr) 28px minmax(180px,1fr) minmax(190px,.8fr) auto; gap:10px; align-items:end; }
+  .comparison-control { display:flex; flex-direction:column; gap:5px; min-width:0; }
+  .comparison-control label { color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }
+  .comparison-arrow { padding-bottom:8px; color:var(--muted); font-size:20px; text-align:center; }
+  .alignment-summary { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:16px 0 10px; }
+  .alignment-legend { display:flex; gap:7px; align-items:center; flex-wrap:wrap; margin-left:auto; }
+  .alignment-legend span { display:inline-flex; gap:5px; align-items:center; color:var(--muted); font-size:12px; }
+  .alignment-legend i { width:10px; height:10px; border-radius:50%; background:var(--relation-color); }
+  .alignment-graph { overflow-x:auto; border:1px solid var(--line); border-radius:9px; background:var(--panel2); }
+  .alignment-graph svg { display:block; height:220px; }
+  .trace-lane-label { fill:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; }
+  .trace-list-link { stroke:var(--muted); stroke-width:2; opacity:.5; }
+  .trace-cross-link { fill:none; stroke:var(--relation-color); stroke-width:2.5; opacity:.72; cursor:pointer; transition:stroke-width .12s,opacity .12s; }
+  .trace-cross-hit { fill:none; stroke:transparent; stroke-width:16; cursor:pointer; }
+  .trace-cross-link:hover,.trace-cross-link.selected { stroke-width:5; opacity:1; }
+  .trace-node { cursor:pointer; outline:none; }
+  .trace-node rect { fill:var(--panel); stroke:var(--relation-color,var(--line)); stroke-width:2; transition:stroke-width .12s,fill .12s; }
+  .trace-node text { fill:var(--text); font:650 12px ui-monospace,SFMono-Regular,Consolas,monospace; pointer-events:none; text-anchor:middle; dominant-baseline:central; }
+  .trace-node:hover rect,.trace-node:focus rect,.trace-node.selected rect { stroke-width:4; fill:color-mix(in srgb,var(--relation-color,var(--brand)) 12%,var(--panel)); }
+  .relation-match { --relation-color:#0f766e; }
+  .relation-updated { --relation-color:#d97706; }
+  .relation-inserted { --relation-color:#2563eb; }
+  .relation-deleted { --relation-color:#b91c1c; }
+  @media(prefers-color-scheme:dark) {
+    .relation-match { --relation-color:#2dd4bf; }
+    .relation-updated { --relation-color:#fbbf24; }
+    .relation-inserted { --relation-color:#60a5fa; }
+    .relation-deleted { --relation-color:#f87171; }
+  }
+  .comparison-code-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:14px; margin-top:16px; }
+  .comparison-code-pane { min-width:0; border:1px solid var(--line); border-radius:9px; overflow:hidden; background:var(--panel2); }
+  .comparison-code-header { min-height:62px; padding:10px 12px; border-bottom:1px solid var(--line); background:var(--panel); }
+  .comparison-code-header strong,.comparison-code-header small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .comparison-code-editor { height:min(520px,48vh); min-height:300px; background:var(--code); }
+  .comparison-code-empty { display:grid; min-height:180px; place-items:center; padding:20px; color:var(--muted); text-align:center; }
+  .comparison-code-editor[hidden],.comparison-code-empty[hidden] { display:none !important; }
+  @media(max-width:980px) {
+    .comparison-controls { grid-template-columns:1fr 28px 1fr; }
+    .comparison-controls .algorithm { grid-column:1 / span 2; }
+    .comparison-controls button { grid-column:3; }
+  }
+  @media(max-width:760px) {
+    .comparison-controls,.comparison-code-grid { grid-template-columns:1fr; }
+    .comparison-arrow { display:none; }
+    .comparison-controls .algorithm,.comparison-controls button { grid-column:auto; }
+  }
+</style>
+<div id="header"><h1>Session {{ session_id }}</h1></div>
+<div class="grid two">
+  <section class="card">
+    <div class="card-header">Branch Tree</div>
+    <div id="branches" class="card-body stack"></div>
+  </section>
+  <section class="card">
+    <div class="card-header">Branch Steps</div>
+    <div id="steps" class="card-body"><p class="muted">Select a branch.</p></div>
+  </section>
+</div>
+<section class="card" style="margin-top:16px">
+  <div class="card-header">Branch Comparison</div>
+  <div id="alignment" class="card-body">
+    <p class="muted">Loading comparison tools…</p>
+  </div>
+</section>
+{% endblock %}
 {% block scripts %}
+<script src="/static/codemirror.js"></script>
 <script>
-  const sessionId={{ session_id|tojson }};
-  function stepName(step){if(step.function_call)return step.function_call.qualified_name||step.function_call.function;if(step.stack_snapshot)return `Line ${step.stack_snapshot.line}`;return 'Step';}
-  async function loadBranch(id,item){document.querySelectorAll('.list-item').forEach(x=>x.classList.remove('selected'));item?.classList.add('selected');const branch=await fetchJson(`/api/branch/${id}?resolve=true`);document.getElementById('steps').innerHTML=`<div class="row"><strong>${escapeHtml(branch.name||`Branch ${id}`)}</strong><span class="badge">${escapeHtml(branch.status)}</span><span class="badge brand">${branch.steps.length} resolved steps</span></div><div class="stack" style="margin-top:12px">${branch.steps.map(step=>`<details><summary>#${step.position} · ${escapeHtml(stepName(step))}</summary><p class="muted">Step ${step.id} · ${escapeHtml(step.kind)}${step.source_step_id?` · source ${step.source_step_id}`:''}</p><pre>${escapeHtml(JSON.stringify(step,null,2))}</pre></details>`).join('')}</div>`;}
-  fetchJson(`/api/session/${sessionId}`).then(session=>{document.getElementById('header').innerHTML=`<div class="row"><h1 style="margin:0">${escapeHtml(session.name||`Session ${session.id}`)}</h1><span class="badge ${session.status==='completed'?'ok':''}">${escapeHtml(session.status)}</span><span class="badge">${escapeHtml(session.step_kind)}</span></div><p class="muted">${escapeHtml(session.description||'')} · ${escapeHtml(session.start_time||'')}</p>`;document.getElementById('branches').innerHTML=session.branches.map(branch=>`<div class="list-item" data-id="${branch.id}" style="margin-left:${branch.parent_branch_id?24:0}px"><div class="row"><strong>${escapeHtml(branch.name||`Branch ${branch.id}`)}</strong><span class="badge">${escapeHtml(branch.status)}</span></div><small class="muted">${branch.parent_branch_id?`fork of ${branch.parent_branch_id} at step ${branch.forked_from_step_id}`:'root'} · ${branch.step_count} own steps</small></div>`).join('');document.querySelectorAll('[data-id]').forEach(item=>item.onclick=()=>loadBranch(item.dataset.id,item));const first=document.querySelector('[data-id]');if(first)loadBranch(first.dataset.id,first);}).catch(error=>document.getElementById('header').innerHTML=`<p class="error">${escapeHtml(error.message)}</p>`);
+  const sessionId = {{ session_id|tojson }};
+  let sessionData = null;
+  let algorithms = [];
+  let selectedBranch = null;
+  let activeComparison = null;
+  let selectionVersion = 0;
+  const codeDefinitions = new Map();
+  const codeViews = {reference: null, target: null};
+
+  function stepName(step) {
+    if (step?.function_call) return step.function_call.qualified_name || step.function_call.function;
+    if (step?.stack_snapshot) return `Line ${step.stack_snapshot.line}`;
+    return 'Step';
+  }
+
+  function stepLine(step) {
+    return step?.stack_snapshot?.line ?? step?.function_call?.line ?? null;
+  }
+
+  function stepCodeDefinitionId(step) {
+    return step?.stack_snapshot?.code_definition_id ?? step?.function_call?.code_definition_id ?? null;
+  }
+
+  function branchLabel(branch) {
+    return `${branch.name || `Branch ${branch.id}`} · #${branch.id}`;
+  }
+
+  function branchOptions(branches, selectedId) {
+    return branches.map(branch => `
+      <option value="${branch.id}" ${branch.id === selectedId ? 'selected' : ''}>${escapeHtml(branchLabel(branch))}</option>`).join('');
+  }
+
+  function comparisonBranches() {
+    return sessionData.branches.filter(reference =>
+      sessionData.branches.some(target => target.parent_branch_id === reference.id)
+    );
+  }
+
+  function renderComparisonControls(preferredTargetId = null) {
+    const panel = document.getElementById('alignment');
+    const references = comparisonBranches();
+    if (!references.length) {
+      panel.innerHTML = '<p class="muted">Record a fork to compare branches in this session.</p>';
+      return;
+    }
+    const preferredTarget = sessionData.branches.find(branch =>
+      branch.id === Number(preferredTargetId) && branch.parent_branch_id
+    );
+    const referenceId = preferredTarget?.parent_branch_id ?? references[0].id;
+    const targets = sessionData.branches.filter(branch => branch.parent_branch_id === referenceId);
+    const targetId = preferredTarget?.id ?? targets[0].id;
+    const offline = algorithms.filter(item =>
+      item.offline && (item.name !== 'stack-snapshot' || sessionData.step_kind === 'stack_snapshot')
+    );
+    const defaultOption = sessionData.step_kind === 'stack_snapshot'
+      ? '<option value="">Default for stack snapshots</option>'
+      : '';
+    const algorithmOptions = defaultOption || offline.length
+      ? `${defaultOption}${offline.map(item => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)} · ${escapeHtml(item.version)}</option>`).join('')}`
+      : '<option value="">No offline algorithm</option>';
+
+    panel.innerHTML = `
+      <div class="comparison-controls">
+        <div class="comparison-control">
+          <label for="comparison-reference">Reference branch</label>
+          <select id="comparison-reference">${branchOptions(references, referenceId)}</select>
+        </div>
+        <div class="comparison-arrow" aria-hidden="true">→</div>
+        <div class="comparison-control">
+          <label for="comparison-target">Fork branch</label>
+          <select id="comparison-target">${branchOptions(targets, targetId)}</select>
+        </div>
+        <div class="comparison-control algorithm">
+          <label for="alignment-algorithm">Algorithm</label>
+          <select id="alignment-algorithm">${algorithmOptions}</select>
+        </div>
+        <button id="run-alignment" class="primary" ${(!defaultOption && !offline.length) ? 'disabled' : ''}>Compare</button>
+      </div>
+      <div id="alignment-result" aria-live="polite" style="margin-top:14px">
+        <p class="muted">Choose a related branch pair. Alignments are calculated on demand and are not stored.</p>
+      </div>`;
+
+    document.getElementById('comparison-reference').onchange = updateComparisonTargets;
+    document.getElementById('run-alignment').onclick = runAlignment;
+  }
+
+  function updateComparisonTargets(preferredTargetId = null) {
+    const referenceId = Number(document.getElementById('comparison-reference').value);
+    const targets = sessionData.branches.filter(branch => branch.parent_branch_id === referenceId);
+    const preferred = targets.some(branch => branch.id === Number(preferredTargetId))
+      ? Number(preferredTargetId)
+      : targets[0]?.id;
+    document.getElementById('comparison-target').innerHTML = branchOptions(targets, preferred);
+  }
+
+  function focusComparisonOnBranch(branch) {
+    if (!branch?.parent_branch_id || !document.getElementById('comparison-reference')) return;
+    document.getElementById('comparison-reference').value = String(branch.parent_branch_id);
+    updateComparisonTargets(branch.id);
+  }
+
+  async function runAlignment() {
+    const button = document.getElementById('run-alignment');
+    const output = document.getElementById('alignment-result');
+    const referenceBranchId = Number(document.getElementById('comparison-reference').value);
+    const targetBranchId = Number(document.getElementById('comparison-target').value);
+    const selectedAlgorithm = document.getElementById('alignment-algorithm').value;
+    button.disabled = true;
+    output.innerHTML = '<p class="muted">Aligning branch traces…</p>';
+    try {
+      const request = {
+        reference_branch_id: referenceBranchId,
+        target_branch_id: targetBranchId,
+        options: {}
+      };
+      if (selectedAlgorithm) request.algorithm = selectedAlgorithm;
+      const [response, reference, target] = await Promise.all([
+        fetchJson('/api/alignment/compare', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(request)
+        }),
+        fetchJson(`/api/branch/${referenceBranchId}?resolve=true`),
+        fetchJson(`/api/branch/${targetBranchId}`)
+      ]);
+      const alignment = response.alignment;
+      activeComparison = {
+        alignment,
+        reference,
+        target,
+        referenceSteps: new Map(reference.steps.map(step => [step.id, step])),
+        targetSteps: new Map(target.steps.map(step => [step.id, step]))
+      };
+      renderAlignmentResult();
+    } catch (error) {
+      activeComparison = null;
+      output.innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function renderAlignmentResult() {
+    const output = document.getElementById('alignment-result');
+    const {alignment, reference, target, referenceSteps, targetSteps} = activeComparison;
+    destroyCodeViews();
+    output.innerHTML = `
+      <div class="alignment-summary">
+        <strong>${escapeHtml(branchLabel(reference))}</strong>
+        <span aria-hidden="true">→</span>
+        <strong>${escapeHtml(branchLabel(target))}</strong>
+        <span class="badge">${escapeHtml(alignment.algorithm)} · ${escapeHtml(alignment.algorithm_version)}</span>
+        <span class="badge brand">${alignment.links.length} aligned rows</span>
+        <span class="alignment-legend" aria-label="Alignment relation legend">
+          <span class="relation-match"><i></i>match</span>
+          <span class="relation-updated"><i></i>updated</span>
+          <span class="relation-inserted"><i></i>inserted</span>
+          <span class="relation-deleted"><i></i>deleted</span>
+        </span>
+      </div>
+      ${alignmentGraphMarkup()}
+      <div class="comparison-code-grid">
+        ${codePaneMarkup('reference', 'Reference source')}
+        ${codePaneMarkup('target', 'Fork source')}
+      </div>`;
+    for (const side of ['reference', 'target']) {
+      codeViews[side] = new SpaceTimeCodeMirror.ReadOnlyCodeView(
+        document.getElementById(`${side}-code`)
+      );
+    }
+    output.querySelectorAll('[data-alignment-index]').forEach(element => {
+      element.onclick = () => selectAlignmentLink(Number(element.dataset.alignmentIndex));
+      element.onkeydown = event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          selectAlignmentLink(Number(element.dataset.alignmentIndex));
+        }
+      };
+    });
+    if (alignment.links.length) {
+      const pairedIndex = alignment.links.findIndex(link =>
+        link.reference_step_id != null && link.target_step_id != null
+      );
+      selectAlignmentLink(pairedIndex >= 0 ? pairedIndex : 0);
+    }
+  }
+
+  function alignmentGraphMarkup() {
+    const {alignment, referenceSteps, targetSteps} = activeComparison;
+    const referenceTrace = alignment.links
+      .map(link => referenceSteps.get(link.reference_step_id))
+      .filter(Boolean);
+    const targetTrace = alignment.links
+      .map(link => targetSteps.get(link.target_step_id))
+      .filter(Boolean);
+    const referencePositions = new Map(referenceTrace.map((step, index) => [step.id, index]));
+    const targetPositions = new Map(targetTrace.map((step, index) => [step.id, index]));
+    const stepGap = 76;
+    const laneStart = 108;
+    const nodeWidth = 54;
+    const referenceY = 58;
+    const targetY = 162;
+    const traceLength = Math.max(referenceTrace.length, targetTrace.length, 1);
+    const width = Math.max(680, laneStart + (traceLength - 1) * stepGap + 72);
+    const xFor = index => laneStart + index * stepGap;
+
+    function listLinks(trace, y) {
+      return trace.slice(1).map((step, index) => `
+        <line class="trace-list-link" x1="${xFor(index) + nodeWidth / 2}" y1="${y}" x2="${xFor(index + 1) - nodeWidth / 2}" y2="${y}" marker-end="url(#trace-arrow)"></line>`).join('');
+    }
+
+    function stepNode(step, index, side, y) {
+      const linkIndex = alignment.links.findIndex(link =>
+        side === 'reference'
+          ? link.reference_step_id === step.id
+          : link.target_step_id === step.id
+      );
+      const relation = alignment.links[linkIndex].relation;
+      const line = stepLine(step);
+      const label = line == null ? `#${step.position}` : `L${line}`;
+      return `
+        <g class="trace-node relation-${escapeHtml(relation)}" data-alignment-index="${linkIndex}" tabindex="0" role="button" aria-label="${escapeHtml(`${side} ${stepName(step)}, ${relation}`)}" transform="translate(${xFor(index)},${y})">
+          <title>${escapeHtml(`${stepName(step)} · step ${step.id} · position ${step.position} · ${relation}`)}</title>
+          <rect x="${-nodeWidth / 2}" y="-16" width="${nodeWidth}" height="32" rx="16"></rect>
+          <text y="1">${escapeHtml(label)}</text>
+        </g>`;
+    }
+
+    const crossLinks = alignment.links.map((link, index) => {
+      if (link.reference_step_id == null || link.target_step_id == null) return '';
+      const referenceX = xFor(referencePositions.get(link.reference_step_id));
+      const targetX = xFor(targetPositions.get(link.target_step_id));
+      const path = `M ${referenceX} ${referenceY + 17} C ${referenceX} 108, ${targetX} 112, ${targetX} ${targetY - 17}`;
+      return `
+        <path class="trace-cross-link relation-${escapeHtml(link.relation)}" data-alignment-index="${index}" d="${path}">
+          <title>${escapeHtml(link.relation)}</title>
+        </path>
+        <path class="trace-cross-hit" data-alignment-index="${index}" d="${path}"></path>`;
+    }).join('');
+
+    return `
+      <div class="alignment-graph" aria-label="Two linked traces and their alignment">
+        <svg width="${width}" viewBox="0 0 ${width} 220" role="img">
+          <defs>
+            <marker id="trace-arrow" viewBox="0 0 6 6" refX="5" refY="3" markerWidth="5" markerHeight="5" orient="auto">
+              <path d="M 0 0 L 6 3 L 0 6 z" fill="var(--muted)"></path>
+            </marker>
+          </defs>
+          <text class="trace-lane-label" x="14" y="${referenceY + 4}">Reference</text>
+          <text class="trace-lane-label" x="14" y="${targetY + 4}">Fork</text>
+          ${crossLinks}
+          ${listLinks(referenceTrace, referenceY)}
+          ${listLinks(targetTrace, targetY)}
+          ${referenceTrace.map((step, index) => stepNode(step, index, 'reference', referenceY)).join('')}
+          ${targetTrace.map((step, index) => stepNode(step, index, 'fork', targetY)).join('')}
+        </svg>
+      </div>`;
+  }
+
+  function codePaneMarkup(side, title) {
+    return `
+      <section class="comparison-code-pane">
+        <div id="${side}-code-header" class="comparison-code-header">
+          <strong>${escapeHtml(title)}</strong>
+          <small class="muted">Select an aligned trace row.</small>
+        </div>
+        <div id="${side}-code-empty" class="comparison-code-empty">No step selected.</div>
+        <div id="${side}-code" class="comparison-code-editor" hidden></div>
+      </section>`;
+  }
+
+  function destroyCodeViews() {
+    for (const side of ['reference', 'target']) {
+      codeViews[side]?.destroy();
+      codeViews[side] = null;
+    }
+  }
+
+  async function selectAlignmentLink(index) {
+    if (!activeComparison) return;
+    const link = activeComparison.alignment.links[index];
+    if (!link) return;
+    document.querySelectorAll('[data-alignment-index]').forEach(element => {
+      element.classList.toggle(
+        'selected',
+        Number(element.dataset.alignmentIndex) === index
+      );
+    });
+    const referenceStep = activeComparison.referenceSteps.get(link.reference_step_id);
+    const targetStep = activeComparison.targetSteps.get(link.target_step_id);
+    const referenceContext = referenceStep || nearestTraceStep(index, 'reference');
+    const targetContext = targetStep || nearestTraceStep(index, 'target');
+    const version = ++selectionVersion;
+    await Promise.all([
+      renderCodeForStep('reference', referenceContext, version, Boolean(referenceStep)),
+      renderCodeForStep('target', targetContext, version, Boolean(targetStep))
+    ]);
+  }
+
+  function nearestTraceStep(index, side) {
+    const stepMap = side === 'reference'
+      ? activeComparison.referenceSteps
+      : activeComparison.targetSteps;
+    const identifierKey = side === 'reference'
+      ? 'reference_step_id'
+      : 'target_step_id';
+    for (let distance = 1; distance < activeComparison.alignment.links.length; distance++) {
+      for (const candidateIndex of [index - distance, index + distance]) {
+        const candidate = activeComparison.alignment.links[candidateIndex];
+        if (!candidate || candidate[identifierKey] == null) continue;
+        return stepMap.get(candidate[identifierKey]);
+      }
+    }
+    return null;
+  }
+
+  async function loadCodeDefinition(identifier) {
+    if (!codeDefinitions.has(identifier)) {
+      codeDefinitions.set(identifier, fetchJson(`/api/code-definitions/${encodeURIComponent(identifier)}`)
+        .then(payload => payload.code_definition)
+        .catch(error => {
+          codeDefinitions.delete(identifier);
+          throw error;
+        }));
+    }
+    return codeDefinitions.get(identifier);
+  }
+
+  async function renderCodeForStep(side, step, version, highlight = true) {
+    const header = document.getElementById(`${side}-code-header`);
+    const source = document.getElementById(`${side}-code`);
+    const empty = document.getElementById(`${side}-code-empty`);
+    if (!step) {
+      if (codeViews[side].hasSource) {
+        codeViews[side].clearHighlight();
+        source.hidden = false;
+        empty.hidden = true;
+      } else {
+        source.hidden = true;
+        empty.hidden = false;
+        empty.textContent = 'No source context is available on this trace.';
+      }
+      header.innerHTML = `<strong>${side === 'reference' ? 'Reference source' : 'Fork source'}</strong><small class="muted">No corresponding step</small>`;
+      return;
+    }
+    const definitionId = stepCodeDefinitionId(step);
+    if (!definitionId) {
+      if (codeViews[side].hasSource) {
+        codeViews[side].clearHighlight();
+        source.hidden = false;
+        empty.hidden = true;
+      } else {
+        source.hidden = true;
+        empty.hidden = false;
+        empty.textContent = 'No source definition was captured for this trace.';
+      }
+      return;
+    }
+    if (codeViews[side].hasSource) {
+      empty.hidden = true;
+    } else {
+      source.hidden = true;
+      empty.hidden = false;
+      empty.textContent = 'Loading source…';
+    }
+    try {
+      const definition = await loadCodeDefinition(definitionId);
+      if (version !== selectionVersion) return;
+      const activeLine = highlight ? stepLine(step) : null;
+      const firstLine = definition.first_line_number ?? 1;
+      header.innerHTML = `
+        <strong>${escapeHtml(definition.qualified_name || definition.name)}</strong>
+        <small class="muted">${escapeHtml(definition.module_path || '')}${highlight && activeLine != null ? ` · line ${activeLine}` : ' · no corresponding step'}</small>`;
+      empty.hidden = true;
+      source.hidden = false;
+      codeViews[side].setSource(String(definition.code_content || ''), {
+        firstLine,
+        activeLine
+      });
+    } catch (error) {
+      if (version !== selectionVersion) return;
+      source.hidden = true;
+      empty.hidden = false;
+      empty.innerHTML = `<span class="error">${escapeHtml(error.message)}</span>`;
+    }
+  }
+
+  async function loadBranch(id, item) {
+    document.querySelectorAll('#branches .list-item').forEach(element => element.classList.remove('selected'));
+    item?.classList.add('selected');
+    selectedBranch = sessionData.branches.find(branch => branch.id === Number(id));
+    const branch = await fetchJson(`/api/branch/${id}?resolve=true`);
+    document.getElementById('steps').innerHTML = `
+      <div class="row">
+        <strong>${escapeHtml(branch.name || `Branch ${id}`)}</strong>
+        <span class="badge">${escapeHtml(branch.status)}</span>
+        <span class="badge brand">${branch.steps.length} resolved steps</span>
+      </div>
+      <div class="stack" style="margin-top:12px">${branch.steps.map(step => `
+        <details>
+          <summary>#${step.position} · ${escapeHtml(stepName(step))}</summary>
+          <p class="muted">Step ${step.id} · ${escapeHtml(step.kind)}${step.source_step_id ? ` · source ${step.source_step_id}` : ''}</p>
+          <pre>${escapeHtml(JSON.stringify(step, null, 2))}</pre>
+        </details>`).join('')}</div>`;
+    focusComparisonOnBranch(selectedBranch);
+  }
+
+  Promise.all([
+    fetchJson(`/api/session/${sessionId}`),
+    fetchJson('/api/alignment/algorithms')
+  ]).then(([session, available]) => {
+    sessionData = session;
+    algorithms = available.algorithms;
+    document.getElementById('header').innerHTML = `
+      <div class="row">
+        <h1 style="margin:0">${escapeHtml(session.name || `Session ${session.id}`)}</h1>
+        <span class="badge ${session.status === 'completed' ? 'ok' : ''}">${escapeHtml(session.status)}</span>
+        <span class="badge">${escapeHtml(session.step_kind)}</span>
+      </div>
+      <p class="muted">${escapeHtml(session.description || '')} · ${escapeHtml(session.start_time || '')}</p>`;
+    document.getElementById('branches').innerHTML = session.branches.map(branch => `
+      <div class="list-item" data-id="${branch.id}" style="margin-left:${branch.parent_branch_id ? 24 : 0}px">
+        <div class="row">
+          <strong>${escapeHtml(branch.name || `Branch ${branch.id}`)}</strong>
+          <span class="badge">${escapeHtml(branch.status)}</span>
+        </div>
+        <small class="muted">${branch.parent_branch_id ? `fork of ${branch.parent_branch_id} at step ${branch.forked_from_step_id}` : 'root'} · ${branch.step_count} own steps</small>
+      </div>`).join('');
+    document.querySelectorAll('#branches [data-id]').forEach(item => {
+      item.onclick = () => loadBranch(item.dataset.id, item);
+    });
+    const firstChild = session.branches.find(branch => branch.parent_branch_id);
+    renderComparisonControls(firstChild?.id);
+    const initial = document.querySelector(`#branches [data-id="${firstChild?.id ?? session.branches[0]?.id}"]`);
+    if (initial) loadBranch(initial.dataset.id, initial);
+  }).catch(error => {
+    document.getElementById('header').innerHTML = `<p class="error">${escapeHtml(error.message)}</p>`;
+  });
 </script>
 {% endblock %}

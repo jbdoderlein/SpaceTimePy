@@ -1,13 +1,43 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event, Lock
 from typing import TYPE_CHECKING
 
 from fastapi.testclient import TestClient
 
-from spacetimepy import SpaceTime, TraceData, create_api_app, create_explorer_app
+from spacetimepy import (
+    STACK_SNAPSHOT_ALIGNMENT,
+    AlignmentLink,
+    AlignmentRelation,
+    SpaceTime,
+    TraceData,
+    create_api_app,
+    create_explorer_app,
+)
+from spacetimepy.interface.web.service import TraceService
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from spacetimepy import OfflineAlignmentContext
+
+
+class _WebAlignment:
+    name = "web-test"
+    version = "1"
+
+    def align(
+        self,
+        context: OfflineAlignmentContext,
+    ) -> tuple[AlignmentLink, ...]:
+        return (
+            AlignmentLink(
+                context.reference_steps[0],
+                context.target_steps[0],
+                AlignmentRelation.UPDATED,
+            ),
+        )
 
 
 def create_trace(database: Path) -> dict[str, int]:
@@ -94,6 +124,13 @@ def test_json_api_exposes_current_v2_exploration_without_comparison(tmp_path) ->
         assert step["stack_snapshot"]["id"] == identifiers["snapshot"]
         assert step["locals"]["value"]["value"] == 4
 
+        definition_id = step["stack_snapshot"]["code_definition_id"]
+        definition = client.get(f"/api/code-definitions/{definition_id}").json()[
+            "code_definition"
+        ]
+        assert definition["id"] == definition_id
+        assert "def calculate" in definition["code_content"]
+
         calls = client.get("/api/function-calls?function=calculate").json()
         assert calls["total"] == 2
         assert all(call["function"] == "calculate" for call in calls["function_calls"])
@@ -126,9 +163,105 @@ def test_json_api_exposes_current_v2_exploration_without_comparison(tmp_path) ->
         assert f"session:{identifiers['session']}" in graph["nodes"]
         assert graph["edges"]
 
+        assert client.get("/api/alignment/algorithms").json() == {
+            "algorithms": [
+                {
+                    "name": STACK_SNAPSHOT_ALIGNMENT,
+                    "version": "1",
+                    "offline": True,
+                    "online": False,
+                }
+            ]
+        }
+        default_alignment = client.post(
+            "/api/alignment/compare",
+            json={
+                "reference_branch_id": identifiers["root_branch"],
+                "target_branch_id": identifiers["child_branch"],
+            },
+        )
+        assert default_alignment.status_code == 200
+        assert (
+            default_alignment.json()["alignment"]["algorithm"]
+            == STACK_SNAPSHOT_ALIGNMENT
+        )
+        missing_alignment = client.post(
+            "/api/alignment/compare",
+            json={
+                "reference_branch_id": identifiers["root_branch"],
+                "target_branch_id": identifiers["child_branch"],
+                "algorithm": "missing",
+            },
+        )
+        assert missing_alignment.status_code == 404
         assert client.post("/api/refresh").json() == {"refreshed": True}
         assert client.post("/api/compare-traces").status_code == 404
         assert "/api/compare-traces" not in client.get("/openapi.json").json()["paths"]
+
+
+def test_live_runtime_exposes_registered_alignment_on_demand() -> None:
+    space = SpaceTime.open()
+
+    @space.capture.function
+    def calculate(value: int) -> int:
+        return value + 1
+
+    try:
+        with space.capture.recording() as recording:
+            calculate(1)
+        root = space.data.get_branch(recording.branch_id)
+        replay = space.replay.run(
+            lambda context: calculate(context.locals["value"] + 1),
+            parent_branch_id=root.id,
+            forked_from_step_id=root.steps[0].id,
+        )
+        space.alignment.register(
+            "web-test",
+            version="1",
+            offline=_WebAlignment,
+        )
+
+        with TestClient(create_api_app(space)) as client:
+            algorithms = client.get("/api/alignment/algorithms").json()
+            assert algorithms == {
+                "algorithms": [
+                    {
+                        "name": STACK_SNAPSHOT_ALIGNMENT,
+                        "version": "1",
+                        "offline": True,
+                        "online": False,
+                    },
+                    {
+                        "name": "web-test",
+                        "version": "1",
+                        "offline": True,
+                        "online": False,
+                    },
+                ]
+            }
+
+            response = client.post(
+                "/api/alignment/compare",
+                json={
+                    "reference_branch_id": root.id,
+                    "target_branch_id": replay.branch.id,
+                    "algorithm": "web-test",
+                    "options": {},
+                },
+            )
+
+        assert response.status_code == 200
+        alignment = response.json()["alignment"]
+        assert alignment["algorithm"] == "web-test"
+        assert alignment["links"] == [
+            {
+                "reference_step_id": root.steps[0].id,
+                "target_step_id": replay.branch.steps[0].id,
+                "relation": "updated",
+            }
+        ]
+    finally:
+        space.close()
 
 
 def test_browser_explorer_keeps_previous_views_but_omits_comparison(tmp_path) -> None:
@@ -143,10 +276,73 @@ def test_browser_explorer_keeps_previous_views_but_omits_comparison(tmp_path) ->
 
         assert client.get("/sessions").status_code == 200
         assert client.get(f"/session/{identifiers['session']}").status_code == 200
+        session = client.get(f"/session/{identifiers['session']}")
+        assert "Branch Comparison" in session.text
+        assert 'id="comparison-reference"' in session.text
+        assert 'class="comparison-code-grid"' in session.text
+        assert 'class="alignment-graph"' in session.text
+        assert 'class="trace-cross-link' in session.text
+        assert "nearestTraceStep" in session.text
+        assert "SpaceTimeCodeMirror.ReadOnlyCodeView" in session.text
+        assert ".comparison-code-empty[hidden]" in session.text
+        assert "/api/code-definitions/" in session.text
+        code_mirror = client.get("/static/codemirror.js")
+        assert code_mirror.status_code == 200
+        assert "ReadOnlyCodeView" in code_mirror.text
+        assert "clearHighlight" in code_mirror.text
         assert client.get("/stack-recordings").status_code == 200
-        assert (
-            client.get(f"/stack-recording/{identifiers['call']}").status_code
-            == 200
-        )
+        assert client.get(f"/stack-recording/{identifiers['call']}").status_code == 200
         assert client.get("/graph").status_code == 200
         assert client.get("/compare-traces").status_code == 404
+
+
+def test_concurrent_branch_payloads_serialize_database_access(tmp_path) -> None:
+    database = tmp_path / "trace.db"
+    identifiers = create_trace(database)
+
+    with TraceData.open(database) as data:
+        service = TraceService(data)
+        original = data.get_function_call
+        start = Barrier(3)
+        second_entered = Event()
+        counter_lock = Lock()
+        active_calls = 0
+        maximum_active_calls = 0
+
+        def tracked_get_function_call(call_id: int):
+            nonlocal active_calls, maximum_active_calls
+            with counter_lock:
+                active_calls += 1
+                maximum_active_calls = max(maximum_active_calls, active_calls)
+                first = active_calls == 1
+            if first:
+                second_entered.wait(0.05)
+            else:
+                second_entered.set()
+            try:
+                return original(call_id)
+            finally:
+                with counter_lock:
+                    active_calls -= 1
+
+        data.get_function_call = tracked_get_function_call
+
+        def load_branch(branch_id: int, *, resolve: bool = False):
+            start.wait()
+            return service.branch(branch_id, resolve=resolve)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reference = executor.submit(
+                load_branch,
+                identifiers["root_branch"],
+                resolve=True,
+            )
+            target = executor.submit(
+                load_branch,
+                identifiers["child_branch"],
+            )
+            start.wait()
+            assert reference.result()["id"] == identifiers["root_branch"]
+            assert target.result()["id"] == identifiers["child_branch"]
+
+        assert maximum_active_calls == 1
