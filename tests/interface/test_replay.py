@@ -98,6 +98,83 @@ class TestReplayInterface(SpaceTimeTestCase):
         with self.assertRaisesRegex(ReplayDivergenceError, "exhausted"):
             context.external.take(read_external)
 
+    def test_active_external_runs_real_effect_and_records_mocked_outcome(
+        self,
+    ) -> None:
+        effects: list[int] = []
+
+        @self.space.capture.external
+        def read_external(value: int) -> int:
+            effects.append(value)
+            return value * 2
+
+        @self.space.capture.function
+        def original(value: int) -> int:
+            return read_external(value) + 1
+
+        with self.space.capture.recording() as recording:
+            self.assertEqual(original(3), 7)
+        root = self.space.data.get_branch(recording.branch_id)
+        source = root.steps[0]
+
+        def execute(context):
+            active_external = self.space.capture.external(
+                context.external.active(read_external)
+            )
+
+            @self.space.capture.function
+            def changed(value: int) -> int:
+                return active_external(value) + 1
+
+            try:
+                return changed(100)
+            finally:
+                self.space.capture.unregister(changed)
+                self.space.capture.unregister(active_external)
+
+        result = self.space.replay.run(
+            execute,
+            parent_branch_id=root.id,
+            forked_from_step_id=source.id,
+            require_external_consumption=True,
+        )
+        child = self.space.data.get_branch(result.branch.id, resolve=True)
+
+        self.assertEqual(effects, [3, 100])
+        self.assertEqual(result.value, 7)
+        self.assertEqual(len(child.steps[-1].external_interactions), 1)
+        replayed_call = child.steps[-1].external_interactions[0].call
+        self.assertEqual(
+            self.space.data.load_value(replayed_call.return_reference),
+            6,
+        )
+
+    def test_active_external_propagates_real_failure_without_consuming_record(
+        self,
+    ) -> None:
+        @self.space.capture.external
+        def read_external(value: int) -> int:
+            if value < 0:
+                raise RuntimeError("real call failed")
+            return value * 2
+
+        @self.space.capture.function
+        def original(value: int) -> int:
+            return read_external(value)
+
+        with self.space.capture.recording() as recording:
+            original(3)
+        source = self.space.data.get_branch(recording.branch_id).steps[0]
+        context = self.space.replay.prepare(
+            parent_branch_id=recording.branch_id,
+            forked_from_step_id=source.id,
+        )
+
+        active_external = context.external.active(read_external)
+        with self.assertRaisesRegex(RuntimeError, "real call failed"):
+            active_external(-1)
+        self.assertEqual(context.external.remaining, 1)
+
     def test_external_script_accepts_the_original_name_of_a_replay_mock(self) -> None:
         @self.space.capture.external(
             start_hooks=(

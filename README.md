@@ -332,6 +332,14 @@ The current monitoring backend can register Python functions with code objects
 directly. A C-backed operation can be exposed through a small decorated Python
 function such as `read_input` above.
 
+Replay integrations can replace an external function with
+`context.external.mock(target)` to return its recorded outcome without calling
+the target. `context.external.active(target)` calls the real target with
+capture temporarily suppressed, then returns or raises the recorded outcome.
+If the real call raises, that exception propagates and the recorded interaction
+remains unconsumed. Integrations remain responsible for installing the returned
+replacement callable.
+
 ## Custom picklers
 
 Import application or integration-owned custom-pickler providers and pass them

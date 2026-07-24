@@ -106,10 +106,20 @@ class ExternalInteractionScript:
     """Consume recorded external results in their original call order."""
 
     def __init__(
-        self, interactions: tuple[RecordedExternalInteraction, ...]
+        self,
+        interactions: tuple[RecordedExternalInteraction, ...],
+        *,
+        active_runner: (
+            Callable[
+                [Callable[..., Any], tuple[Any, ...], dict[str, Any]],
+                Any,
+            ]
+            | None
+        ) = None,
     ) -> None:
         self._state = _ExternalInteractionState(interactions)
         self._step_states: dict[int, _ExternalInteractionState] = {}
+        self._active_runner = active_runner
 
     @property
     def remaining(self) -> int:
@@ -123,6 +133,26 @@ class ExternalInteractionScript:
     def take(self, target: Callable[..., Any] | str) -> Any:
         """Return/raise the next recorded outcome after validating its name."""
 
+        interaction = self._validate_next(target)
+        self._state.position += 1
+        if interaction.outcome == FunctionCallOutcome.RAISED.value:
+            if isinstance(interaction.exception, BaseException):
+                raise interaction.exception
+            raise ReplayDivergenceError(
+                "The recorded external call raised an exception that could "
+                "not be materialized as a BaseException"
+            )
+        if interaction.outcome != FunctionCallOutcome.RETURNED.value:
+            raise ReplayDivergenceError(
+                f"Recorded external call has non-replayable outcome "
+                f"{interaction.outcome!r}"
+            )
+        return interaction.return_value
+
+    def _validate_next(
+        self,
+        target: Callable[..., Any] | str,
+    ) -> RecordedExternalInteraction:
         if self._state.error is not None:
             raise ReplayDivergenceError(
                 "External interaction replay is unavailable because online "
@@ -146,21 +176,7 @@ class ExternalInteractionScript:
                 f"Expected external call {expected!r}, got "
                 f"{self._target_label(target)!r}"
             )
-
-        self._state.position += 1
-        if interaction.outcome == FunctionCallOutcome.RAISED.value:
-            if isinstance(interaction.exception, BaseException):
-                raise interaction.exception
-            raise ReplayDivergenceError(
-                "The recorded external call raised an exception that could "
-                "not be materialized as a BaseException"
-            )
-        if interaction.outcome != FunctionCallOutcome.RETURNED.value:
-            raise ReplayDivergenceError(
-                f"Recorded external call has non-replayable outcome "
-                f"{interaction.outcome!r}"
-            )
-        return interaction.return_value
+        return interaction
 
     def select(
         self,
@@ -194,6 +210,26 @@ class ExternalInteractionScript:
         @wraps(target)
         def replacement(*args: Any, **kwargs: Any) -> Any:
             del args, kwargs
+            return self.take(target)
+
+        return replacement
+
+    def active(self, target: Callable[..., Any]) -> Callable[..., Any]:
+        """Call the real target but return or raise its recorded outcome.
+
+        The real call runs with capture suppressed so that only this replacement
+        is recorded as the replay branch's external interaction.  A real-call
+        exception propagates and leaves the recorded interaction unconsumed.
+        """
+
+        @wraps(target)
+        def replacement(*args: Any, **kwargs: Any) -> Any:
+            self._validate_next(target)
+            if self._active_runner is None:
+                raise ReplayError(
+                    "Active external replay requires a runtime-backed script"
+                )
+            self._active_runner(target, args, kwargs)
             return self.take(target)
 
         return replacement
@@ -715,11 +751,23 @@ class ReplayInterface:
             locals=self._materialize_references(local_refs, loaded_values),
             globals=self._materialize_references(global_refs, loaded_values),
             external_interactions=interactions,
-            external=ExternalInteractionScript(interactions),
+            external=ExternalInteractionScript(
+                interactions,
+                active_runner=self._run_active_external,
+            ),
             recipe=dict(recipe or {}),
             options=dict(options or {}),
             alignment_policy=alignment_policy or ReplayAlignmentPolicy(),
         )
+
+    def _run_active_external(
+        self,
+        target: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        with self._monitor.recording_disabled():
+            return target(*args, **kwargs)
 
     def _start_alignment(
         self,
