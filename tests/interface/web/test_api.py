@@ -41,7 +41,7 @@ class _WebAlignment:
 
 
 def create_trace(database: Path) -> dict[str, int]:
-    space = SpaceTime.open(database)
+    space = SpaceTime.open(database, profile_capture=True)
 
     @space.capture.line
     def calculate(value: int) -> int:
@@ -86,7 +86,10 @@ def test_trace_data_offline_reader_lists_transport_neutral_entities(tmp_path) ->
         assert statistics.session_count == 1
         assert statistics.branch_count == 2
         assert statistics.step_count >= 2
+        assert statistics.function_call_capture_performance_count == 2
         assert len(data.list_function_calls()) == 2
+        assert len(data.list_function_call_performances()) == 2
+        assert data.get_function_call_performance(identifiers["call"]) is not None
         assert data.list_stack_snapshots(identifiers["call"])
         assert data.list_code_definitions()
         assert data.list_stored_values()
@@ -103,6 +106,7 @@ def test_json_api_exposes_current_v2_exploration_without_comparison(tmp_path) ->
         health = client.get("/api/health")
         assert health.status_code == 200
         assert health.json()["branch_count"] == 2
+        assert health.json()["profiled_function_call_count"] == 2
 
         sessions = client.get("/api/sessions").json()["sessions"]
         assert sessions[0]["name"] == "API example"
@@ -134,10 +138,27 @@ def test_json_api_exposes_current_v2_exploration_without_comparison(tmp_path) ->
         calls = client.get("/api/function-calls?function=calculate").json()
         assert calls["total"] == 2
         assert all(call["function"] == "calculate" for call in calls["function_calls"])
+        assert all(
+            call["capture_performance"] is not None
+            for call in calls["function_calls"]
+        )
 
         call = client.get(f"/api/function-call/{identifiers['call']}").json()
         assert call["function_call"]["locals"]["value"]["value"] == 4
         assert call["function_call"]["has_stack_recording"] is True
+        performance = call["function_call"]["capture_performance"]
+        assert performance["unit"] == "nanoseconds"
+        assert performance["direct_capture_ns"] >= 0
+        assert performance["inclusive_capture_ns"] >= performance["direct_capture_ns"]
+        assert performance["line_event_count"] > 0
+
+        performance_endpoint = client.get(
+            f"/api/function-call/{identifiers['call']}/capture-performance"
+        )
+        assert performance_endpoint.status_code == 200
+        assert (
+            performance_endpoint.json()["capture_performance"] == performance
+        )
 
         stack = client.get(f"/api/stack-recording/{identifiers['call']}").json()
         assert stack["frames"]
@@ -272,6 +293,8 @@ def test_browser_explorer_keeps_previous_views_but_omits_comparison(tmp_path) ->
         index = client.get("/")
         assert index.status_code == 200
         assert "Function Calls" in index.text
+        assert "capturePerformanceTable" in index.text
+        assert "formatCaptureDuration" in index.text
         assert "Compare Traces" not in index.text
 
         assert client.get("/sessions").status_code == 200
@@ -292,6 +315,9 @@ def test_browser_explorer_keeps_previous_views_but_omits_comparison(tmp_path) ->
         assert "clearHighlight" in code_mirror.text
         assert client.get("/stack-recordings").status_code == 200
         assert client.get(f"/stack-recording/{identifiers['call']}").status_code == 200
+        function_call = client.get(f"/function-call/{identifiers['call']}")
+        assert function_call.status_code == 200
+        assert "Capture Performance" in function_call.text
         assert client.get("/graph").status_code == 200
         assert client.get("/compare-traces").status_code == 404
 

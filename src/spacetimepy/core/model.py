@@ -291,6 +291,7 @@ class FunctionCall(Base):
     capture_performance: Mapped[FunctionCallCapturePerformance | None] = relationship(
         back_populates="function_call",
         cascade="all, delete-orphan",
+        lazy="joined",
         uselist=False,
     )
 

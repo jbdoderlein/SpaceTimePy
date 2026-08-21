@@ -98,6 +98,32 @@
       if (!entries.length) return '<p class="muted">No captured values.</p>';
       return `<div class="kv">${entries.map(([name,item]) => `<div>${escapeHtml(name)}</div><div><span class="badge">${escapeHtml(item.type)}</span> <code>${escapeHtml(valueText(item))}</code></div>`).join('')}</div>`;
     }
+    function formatCaptureDuration(nanoseconds) {
+      if (nanoseconds == null) return '—';
+      if (nanoseconds < 1_000) return `${nanoseconds} ns`;
+      if (nanoseconds < 1_000_000) return `${(nanoseconds / 1_000).toFixed(2)} µs`;
+      if (nanoseconds < 1_000_000_000) return `${(nanoseconds / 1_000_000).toFixed(3)} ms`;
+      return `${(nanoseconds / 1_000_000_000).toFixed(3)} s`;
+    }
+    function capturePerformanceTable(performance) {
+      if (!performance) return '<p class="muted">Capture profiling was disabled for this call.</p>';
+      const rows = [
+        ['Direct capture', formatCaptureDuration(performance.direct_capture_ns)],
+        ['Inclusive capture', formatCaptureDuration(performance.inclusive_capture_ns)],
+        ['Function entry', formatCaptureDuration(performance.start_capture_ns)],
+        ['Function return', formatCaptureDuration(performance.return_capture_ns)],
+        ['Exception unwind', formatCaptureDuration(performance.unwind_capture_ns)]
+      ];
+      if (performance.line_event_count) {
+        rows.push(
+          ['Line callbacks', `${performance.line_event_count} (${performance.line_snapshot_count} snapshots, ${performance.filtered_line_event_count} filtered)`],
+          ['Line capture total', formatCaptureDuration(performance.line_capture_ns)],
+          ['Line capture average', formatCaptureDuration(performance.line_capture_average_ns)],
+          ['Line capture range', `${formatCaptureDuration(performance.line_capture_min_ns)} – ${formatCaptureDuration(performance.line_capture_max_ns)}`]
+        );
+      }
+      return `<div class="kv">${rows.map(([name,value]) => `<div>${escapeHtml(name)}</div><div><code>${escapeHtml(value)}</code></div>`).join('')}</div><p class="muted" style="margin-bottom:0">Monotonic callback timings; profiler bookkeeping and final persistence are excluded.</p>`;
+    }
     const currentPath = location.pathname;
     document.querySelectorAll('[data-nav]').forEach(link => { const target=link.dataset.nav; if (currentPath===target || (target!=='/' && currentPath.startsWith(target))) link.classList.add('active'); });
     fetchJson('/api/db-info').then(info => { document.getElementById('db-status').textContent = `${info.session_count} sessions · ${info.branch_count} branches`; }).catch(error => { const status=document.getElementById('db-status'); status.textContent='API error'; status.classList.add('error'); status.title=error.message; });

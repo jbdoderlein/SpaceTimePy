@@ -23,6 +23,7 @@ from spacetimepy.core.model import (
     ExecutionStep,
     ExternalInteractionOccurrence,
     FunctionCall,
+    FunctionCallCapturePerformance,
     ObjectIdentity,
     StackSnapshot,
     StoredObject,
@@ -70,6 +71,7 @@ class TraceStatisticsDTO:
     branch_count: int
     step_count: int
     function_call_count: int
+    function_call_capture_performance_count: int
     stack_snapshot_count: int
     external_interaction_count: int
     object_identity_count: int
@@ -90,6 +92,36 @@ class CodeDefinitionDTO:
 
 
 @dataclass(frozen=True, slots=True)
+class FunctionCallCapturePerformanceDTO:
+    function_call_id: int
+    start_capture_ns: int
+    return_capture_ns: int
+    unwind_capture_ns: int
+    line_capture_ns: int
+    direct_capture_ns: int
+    inclusive_capture_ns: int
+    line_event_count: int
+    line_snapshot_count: int
+    filtered_line_event_count: int
+    line_capture_min_ns: int | None
+    line_capture_max_ns: int | None
+
+    @property
+    def direct_capture_ms(self) -> float:
+        return self.direct_capture_ns / 1_000_000
+
+    @property
+    def inclusive_capture_ms(self) -> float:
+        return self.inclusive_capture_ns / 1_000_000
+
+    @property
+    def line_capture_average_ns(self) -> float | None:
+        if self.line_event_count == 0:
+            return None
+        return self.line_capture_ns / self.line_event_count
+
+
+@dataclass(frozen=True, slots=True)
 class FunctionCallDTO:
     id: int
     function_name: str
@@ -107,6 +139,7 @@ class FunctionCallDTO:
     attributes: dict[str, Any]
     code_definition_id: str | None
     caller_call_id: int | None
+    capture_performance: FunctionCallCapturePerformanceDTO | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +383,19 @@ class TraceData:
     def get_function_call(self, call_id: int) -> FunctionCallDTO:
         return self._call_to_dto(self._require(FunctionCall, call_id, "function call"))
 
+    def get_function_call_performance(
+        self,
+        call_id: int,
+    ) -> FunctionCallCapturePerformanceDTO | None:
+        """Return capture-overhead metrics, or ``None`` when profiling was off."""
+
+        call = self._require(FunctionCall, call_id, "function call")
+        return (
+            self._performance_to_dto(call.capture_performance)
+            if call.capture_performance is not None
+            else None
+        )
+
     def get_stack_snapshot(self, snapshot_id: int) -> StackSnapshotDTO:
         return self._snapshot_to_dto(
             self._require(StackSnapshot, snapshot_id, "stack snapshot")
@@ -387,6 +433,19 @@ class TraceData:
             .order_by(FunctionCall.started_at, FunctionCall.id)
         ).all()
         return tuple(self._call_to_dto(call) for call in calls)
+
+    def list_function_call_performances(
+        self,
+    ) -> tuple[FunctionCallCapturePerformanceDTO, ...]:
+        """Return every available per-call capture profile in call order."""
+
+        self._ensure_open()
+        performances = self._database.scalars(
+            select(FunctionCallCapturePerformance).order_by(
+                FunctionCallCapturePerformance.function_call_id
+            )
+        ).all()
+        return tuple(self._performance_to_dto(item) for item in performances)
 
     def list_stack_snapshots(
         self,
@@ -464,6 +523,9 @@ class TraceData:
             branch_count=count(ExecutionBranch),
             step_count=count(ExecutionStep),
             function_call_count=count(FunctionCall),
+            function_call_capture_performance_count=count(
+                FunctionCallCapturePerformance
+            ),
             stack_snapshot_count=count(StackSnapshot),
             external_interaction_count=count(ExternalInteractionOccurrence),
             object_identity_count=count(ObjectIdentity),
@@ -686,6 +748,30 @@ class TraceData:
             attributes=dict(call.attributes),
             code_definition_id=call.code_definition_id,
             caller_call_id=call.caller_call_id,
+            capture_performance=(
+                self._performance_to_dto(call.capture_performance)
+                if call.capture_performance is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _performance_to_dto(
+        performance: FunctionCallCapturePerformance,
+    ) -> FunctionCallCapturePerformanceDTO:
+        return FunctionCallCapturePerformanceDTO(
+            function_call_id=performance.function_call_id,
+            start_capture_ns=performance.start_capture_ns,
+            return_capture_ns=performance.return_capture_ns,
+            unwind_capture_ns=performance.unwind_capture_ns,
+            line_capture_ns=performance.line_capture_ns,
+            direct_capture_ns=performance.direct_capture_ns,
+            inclusive_capture_ns=performance.inclusive_capture_ns,
+            line_event_count=performance.line_event_count,
+            line_snapshot_count=performance.line_snapshot_count,
+            filtered_line_event_count=performance.filtered_line_event_count,
+            line_capture_min_ns=performance.line_capture_min_ns,
+            line_capture_max_ns=performance.line_capture_max_ns,
         )
 
     def _snapshot_to_dto(self, snapshot: StackSnapshot) -> StackSnapshotDTO:
@@ -735,6 +821,7 @@ __all__ = [
     "BranchSummaryDTO",
     "CodeDefinitionDTO",
     "ExternalInteractionDTO",
+    "FunctionCallCapturePerformanceDTO",
     "FunctionCallDTO",
     "SessionDTO",
     "StackSnapshotDTO",

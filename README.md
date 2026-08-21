@@ -297,7 +297,21 @@ integer nanoseconds, separate return and unwind costs, and aggregate line-event
 counts and timings when line capture is active. Measurements stop before
 profiler bookkeeping, and performance rows are kept in memory until branch
 finalization so persisting them is not included in callback timings. The
-programmatic data interface for these rows will be added separately.
+programmatic interface exposes the optional metrics on each call and through
+dedicated queries:
+
+```python
+call = space.data.get_function_call(call_id)
+performance = call.capture_performance
+
+# Equivalent direct lookup; returns None when profiling was disabled.
+performance = space.data.get_function_call_performance(call_id)
+all_performance = space.data.list_function_call_performances()
+```
+
+The JSON API includes `capture_performance` in function-call payloads and also
+provides `/api/function-call/{call_id}/capture-performance`. The browser
+explorer displays direct, inclusive, entry/exit, and line-capture timings.
 
 ## Capture hooks
 

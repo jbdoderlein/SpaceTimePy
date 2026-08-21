@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from spacetimepy.interface.data import (
         BranchDTO,
         CodeDefinitionDTO,
+        FunctionCallCapturePerformanceDTO,
         FunctionCallDTO,
         SessionDTO,
         StackSnapshotDTO,
@@ -105,6 +106,9 @@ class TraceService:
             "branch_count": statistics.branch_count,
             "step_count": statistics.step_count,
             "function_call_count": statistics.function_call_count,
+            "profiled_function_call_count": (
+                statistics.function_call_capture_performance_count
+            ),
             "stack_snapshot_count": statistics.stack_snapshot_count,
             "external_interaction_count": statistics.external_interaction_count,
             "object_identity_count": statistics.object_identity_count,
@@ -286,6 +290,16 @@ class TraceService:
                 }
             )
             return {"function_call": payload}
+
+    def function_call_performance(self, call_id: int) -> dict[str, Any]:
+        """Return optional capture-overhead metrics for one function call."""
+
+        with self._lock:
+            performance = self.data.get_function_call_performance(call_id)
+        return {
+            "function_call_id": call_id,
+            "capture_performance": self._capture_performance_payload(performance),
+        }
 
     def stack_recording(self, call_id: int) -> dict[str, Any]:
         with self._lock:
@@ -669,6 +683,9 @@ class TraceService:
             "has_stack_recording": snapshot_count > 0,
             "snapshot_count": snapshot_count,
             "locations": [self._location_payload(item) for item in locations],
+            "capture_performance": self._capture_performance_payload(
+                call.capture_performance
+            ),
         }
 
     def _call_payload(self, call: FunctionCallDTO) -> dict[str, Any]:
@@ -700,6 +717,32 @@ class TraceService:
             "timestamp": _iso(snapshot.captured_at),
             "captured_at": _iso(snapshot.captured_at),
             "attributes": snapshot.attributes,
+        }
+
+    @staticmethod
+    def _capture_performance_payload(
+        performance: FunctionCallCapturePerformanceDTO | None,
+    ) -> dict[str, Any] | None:
+        if performance is None:
+            return None
+        return {
+            "function_call_id": performance.function_call_id,
+            "clock": "perf_counter_ns",
+            "unit": "nanoseconds",
+            "start_capture_ns": performance.start_capture_ns,
+            "return_capture_ns": performance.return_capture_ns,
+            "unwind_capture_ns": performance.unwind_capture_ns,
+            "line_capture_ns": performance.line_capture_ns,
+            "direct_capture_ns": performance.direct_capture_ns,
+            "inclusive_capture_ns": performance.inclusive_capture_ns,
+            "direct_capture_ms": performance.direct_capture_ms,
+            "inclusive_capture_ms": performance.inclusive_capture_ms,
+            "line_event_count": performance.line_event_count,
+            "line_snapshot_count": performance.line_snapshot_count,
+            "filtered_line_event_count": performance.filtered_line_event_count,
+            "line_capture_min_ns": performance.line_capture_min_ns,
+            "line_capture_max_ns": performance.line_capture_max_ns,
+            "line_capture_average_ns": performance.line_capture_average_ns,
         }
 
     def _snapshot_payload(self, snapshot: StackSnapshotDTO) -> dict[str, Any]:

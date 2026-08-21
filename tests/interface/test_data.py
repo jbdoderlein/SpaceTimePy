@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 
-from spacetimepy import TraceNotFoundError
+from spacetimepy import SpaceTime, TraceNotFoundError
 from tests.support import SpaceTimeTestCase, assert_dto
 
 
@@ -28,6 +28,42 @@ class TestTraceData(SpaceTimeTestCase):
             assert_dto(self, value)
         with self.assertRaises(FrozenInstanceError):
             session.name = "changed"
+
+    def test_capture_performance_is_available_as_a_public_dto(self) -> None:
+        self.space.close()
+        self.space = SpaceTime.open(profile_capture=True)
+
+        recording, step = self.record_call(payload=[1, 2])
+        del recording
+        call = self.space.data.get_function_call(step.function_call.id)
+        performance = self.space.data.get_function_call_performance(call.id)
+
+        self.assertEqual(call.capture_performance, performance)
+        assert_dto(self, performance)
+        self.assertGreaterEqual(performance.direct_capture_ns, 0)
+        self.assertGreaterEqual(
+            performance.inclusive_capture_ns,
+            performance.direct_capture_ns,
+        )
+        self.assertEqual(
+            performance.direct_capture_ms,
+            performance.direct_capture_ns / 1_000_000,
+        )
+        self.assertEqual(
+            self.space.data.list_function_call_performances(),
+            (performance,),
+        )
+        self.assertEqual(
+            self.space.data.get_statistics().function_call_capture_performance_count,
+            1,
+        )
+
+    def test_unprofiled_call_exposes_no_capture_performance(self) -> None:
+        _, step = self.record_call()
+        call = self.space.data.get_function_call(step.function_call.id)
+
+        self.assertIsNone(call.capture_performance)
+        self.assertIsNone(self.space.data.get_function_call_performance(call.id))
 
     def test_session_listing_contains_root_and_branch_summaries(self) -> None:
         first, _ = self.record_call(1)

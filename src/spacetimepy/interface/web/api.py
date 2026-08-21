@@ -201,6 +201,10 @@ def create_api_app(
     def function_call(call_id: int) -> dict[str, Any]:
         return service.function_call(call_id)
 
+    @application.get("/api/function-call/{call_id}/capture-performance")
+    def function_call_performance(call_id: int) -> dict[str, Any]:
+        return service.function_call_performance(call_id)
+
     @application.get("/api/stack-recording/{call_id}")
     def stack_recording(call_id: int) -> dict[str, Any]:
         return service.stack_recording(call_id)
