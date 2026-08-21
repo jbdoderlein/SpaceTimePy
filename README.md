@@ -183,7 +183,7 @@ with spacetimepy.TraceData.open("trace.db") as trace:
     statistics = trace.get_statistics()
 ```
 
-Opening stored values may execute pickle data. Only explore databases you
+Opening stored values may execute Dill payloads. Only explore databases you
 trust, and supply the same custom pickler providers used during capture when
 their classes are needed.
 
@@ -230,7 +230,7 @@ coding agent how to add a small targeted capture when existing evidence is
 insufficient. The MCP itself cannot edit code, run the application, replay a
 branch, or compare traces.
 
-Primitive state is previewed safely. Non-primitive pickle values remain type
+Primitive state is previewed safely. Non-primitive Dill values remain type
 and reference metadata by default. For a trace database you explicitly trust,
 full bounded previews can be enabled with:
 
@@ -238,7 +238,7 @@ full bounded previews can be enabled with:
 uv run spacetimepy-mcp trace.db --trust-stored-values
 ```
 
-This may execute pickle data. The same custom-pickler provider used during
+This may execute Dill payloads. The same custom-pickler provider used during
 recording can be imported with repeatable
 `--custom-pickler MODULE[:ATTRIBUTE]` options.
 
@@ -390,6 +390,10 @@ remains unconsumed. Integrations remain responsible for installing the returned
 replacement callable.
 
 ## Custom picklers
+
+SpaceTimePy uses Dill for non-primitive captured values. Dill supports Python
+objects such as lambdas, closures, and local functions that the standard
+library pickler cannot serialize.
 
 Import application or integration-owned custom-pickler providers and pass them
 when opening the runtime:

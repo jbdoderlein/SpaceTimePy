@@ -152,7 +152,7 @@ class StoredObject(Base):
     type_name: Mapped[str] = mapped_column(String, nullable=False)
     is_primitive: Mapped[bool] = mapped_column(Boolean, nullable=False)
     primitive_value: Mapped[Any | None] = mapped_column(JSON)
-    pickle_data: Mapped[bytes | None] = mapped_column(LargeBinary)
+    dill_data: Mapped[bytes | None] = mapped_column(LargeBinary)
 
     identity: Mapped[ObjectIdentity] = relationship(back_populates="versions")
     code_definitions: Mapped[list[CodeDefinition]] = relationship(
@@ -164,8 +164,8 @@ class StoredObject(Base):
             "identity_id", "version_number", name="uq_stored_object_identity_version"
         ),
         CheckConstraint(
-            "(is_primitive IS TRUE AND pickle_data IS NULL) OR "
-            "(is_primitive IS FALSE AND pickle_data IS NOT NULL)",
+            "(is_primitive IS TRUE AND dill_data IS NULL) OR "
+            "(is_primitive IS FALSE AND dill_data IS NOT NULL)",
             name="ck_stored_object_representation",
         ),
     )

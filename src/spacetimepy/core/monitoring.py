@@ -52,7 +52,7 @@ from .model import (
     StoredObject,
 )
 from .performance import CallCaptureProfile, CaptureProfiler
-from .serialization import PickleSerializer
+from .serialization import DillSerializer
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -136,7 +136,7 @@ class SpaceTimeMonitor:
         *,
         tool_id: int = sys.monitoring.PROFILER_ID,
         flush_batch_size: int = 256,
-        serializer: PickleSerializer | None = None,
+        serializer: DillSerializer | None = None,
         profile_capture: bool = False,
     ) -> SpaceTimeMonitor:
         if cls._instance is None:
@@ -149,7 +149,7 @@ class SpaceTimeMonitor:
         *,
         tool_id: int = sys.monitoring.PROFILER_ID,
         flush_batch_size: int = 256,
-        serializer: PickleSerializer | None = None,
+        serializer: DillSerializer | None = None,
         profile_capture: bool = False,
     ) -> None:
         if not isinstance(profile_capture, bool):
@@ -176,7 +176,7 @@ class SpaceTimeMonitor:
         self.database = database
         self.tool_id = tool_id
         self.flush_batch_size = flush_batch_size
-        self.serializer = serializer or PickleSerializer()
+        self.serializer = serializer or DillSerializer()
         self.capture_profiler = CaptureProfiler() if profile_capture else None
         self.is_recording_enabled = True
         self.last_callback_error: BaseException | None = None
@@ -1552,11 +1552,11 @@ class SpaceTimeMonitor:
             state_digest = hashlib.sha256(canonical).hexdigest()
             identity_hash = f"primitive:{state_digest}"
             object_reference = state_digest
-            pickle_data = None
+            dill_data = None
             primitive_value = value
         else:
-            pickle_data = self.serializer.dumps(value)
-            state_digest = hashlib.sha256(pickle_data).hexdigest()
+            dill_data = self.serializer.dumps(value)
+            state_digest = hashlib.sha256(dill_data).hexdigest()
             identity_hash = f"runtime:{self._identity_namespace}:{id(value)}"
             object_reference = hashlib.sha256(
                 f"{identity_hash}:{state_digest}".encode()
@@ -1592,7 +1592,7 @@ class SpaceTimeMonitor:
             type_name=type_name,
             is_primitive=is_primitive,
             primitive_value=primitive_value,
-            pickle_data=pickle_data,
+            dill_data=dill_data,
         )
         self.database.add(stored)
         self._stored_value_cache[cache_key] = object_reference

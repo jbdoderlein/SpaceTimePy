@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from spacetimepy.core.model import Base
 from spacetimepy.core.monitoring import SpaceTimeMonitor
-from spacetimepy.core.serialization import CustomPickler, PickleSerializer
+from spacetimepy.core.serialization import CustomPickler, DillSerializer
 from spacetimepy.interface.alignment import AlignmentService
 from spacetimepy.interface.capture import CaptureInterface, capture_registry
 from spacetimepy.interface.data import TraceData
@@ -87,7 +87,7 @@ class SpaceTime:
 
         resolved_logging_level = _resolve_logging_level(logging_level)
         profile_capture = _validate_profile_capture(profile_capture)
-        self._serializer = PickleSerializer(custom_picklers)
+        self._serializer = DillSerializer(custom_picklers)
         monitor_options: dict[str, Any] = {
             "flush_batch_size": flush_batch_size,
             "serializer": self._serializer,

@@ -66,8 +66,8 @@ def create_mcp_server(
     ``SpaceTime`` inputs are borrowed. A missing filesystem path is initialized
     as an empty v2 trace so the MCP can run before the first capture.
     Non-primitive values are not deserialized unless ``trust_stored_values`` is
-    explicitly enabled; only do so for trace databases you trust because pickle
-    data may execute code.
+    explicitly enabled; only do so for trace databases you trust because Dill
+    payloads may execute code.
     """
 
     if host not in {"127.0.0.1", "localhost", "::1"}:
@@ -419,8 +419,8 @@ def main() -> None:
         "--trust-stored-values",
         action="store_true",
         help=(
-            "Allow non-primitive pickle deserialization. Only use for trusted "
-            "trace databases because pickle data may execute code."
+            "Allow non-primitive Dill deserialization. Only use for trusted "
+            "trace databases because Dill payloads may execute code."
         ),
     )
     arguments = parser.parse_args()

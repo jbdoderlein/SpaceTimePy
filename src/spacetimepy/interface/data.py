@@ -28,7 +28,7 @@ from spacetimepy.core.model import (
     StackSnapshot,
     StoredObject,
 )
-from spacetimepy.core.serialization import CustomPickler, PickleSerializer
+from spacetimepy.core.serialization import CustomPickler, DillSerializer
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
@@ -230,14 +230,14 @@ class TraceData:
     def __init__(
         self,
         database: Session,
-        serializer: PickleSerializer | None = None,
+        serializer: DillSerializer | None = None,
         *,
         engine: Engine | None = None,
         owns_database: bool = False,
         database_label: str | None = None,
     ) -> None:
         self._database = database
-        self._serializer = serializer or PickleSerializer()
+        self._serializer = serializer or DillSerializer()
         self._engine = engine
         self._owns_database = owns_database
         self._database_label = database_label
@@ -315,7 +315,7 @@ class TraceData:
         database_session = Session(engine, expire_on_commit=False)
         return cls(
             database_session,
-            PickleSerializer(custom_picklers),
+            DillSerializer(custom_picklers),
             engine=engine,
             owns_database=True,
             database_label=database_label,
@@ -554,7 +554,7 @@ class TraceData:
     def load_values(self, references: Collection[str]) -> dict[str, Any]:
         """Materialize several references with one database query.
 
-        Non-primitive values use pickle and therefore trace databases must be
+        Non-primitive values use Dill and therefore trace databases must be
         treated as trusted input.
         """
 
@@ -792,11 +792,11 @@ class TraceData:
     def _deserialize(self, stored: StoredObject) -> Any:
         if stored.is_primitive:
             return stored.primitive_value
-        if stored.pickle_data is None:
+        if stored.dill_data is None:
             raise TraceConsistencyError(
-                f"Non-primitive stored value {stored.id!r} has no pickle data"
+                f"Non-primitive stored value {stored.id!r} has no Dill data"
             )
-        return self._serializer.loads(stored.pickle_data)
+        return self._serializer.loads(stored.dill_data)
 
     def _require(self, model: type[Any], identifier: Any, label: str) -> Any:
         self._ensure_open()

@@ -36,21 +36,23 @@ class TestCustomPicklers(SpaceTimeTestCase):
         )
         self.assertEqual(replay_context.locals["value"], CustomValue("captured"))
 
-    def test_without_custom_pickler_only_unserializable_value_is_omitted(self) -> None:
+    def test_dill_captures_value_without_custom_pickler(self) -> None:
         @self.space.capture.function
         def inspect_value(value: CustomValue, number: int) -> int:
             return number + 1
 
         with self.space.capture.recording() as recording:
-            inspect_value(CustomValue("omitted"), 4)
+            inspect_value(CustomValue("captured by Dill"), 4)
 
         call = self.space.data.get_branch(recording.branch_id).steps[0].function_call
-        self.assertNotIn("value", call.entry_local_references)
         self.assertEqual(
             self.space.data.load_references(call.entry_local_references),
-            {"number": 4},
+            {
+                "value": CustomValue("captured by Dill"),
+                "number": 4,
+            },
         )
-        self.assertIn("value", call.attributes["capture_errors"])
+        self.assertNotIn("capture_errors", call.attributes)
 
     def test_from_session_accepts_same_custom_pickler_configuration(self) -> None:
         self.space.close()

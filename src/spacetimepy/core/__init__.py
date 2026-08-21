@@ -32,8 +32,8 @@ from .serialization import (
     CustomPickler,
     CustomPicklerError,
     CustomPicklerProvider,
+    DillSerializer,
     DispatchTable,
-    PickleSerializer,
     Reducer,
     SerializationError,
 )
@@ -60,7 +60,7 @@ __all__ = [
     "FunctionCallOutcome",
     "MonitoringStateError",
     "ObjectIdentity",
-    "PickleSerializer",
+    "DillSerializer",
     "Reducer",
     "SerializationError",
     "SpaceTimeMonitor",

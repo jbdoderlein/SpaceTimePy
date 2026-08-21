@@ -100,10 +100,10 @@ def test_agent_service_exposes_five_bounded_workflows(tmp_path) -> None:
         assert execution["data"]["steps"][0]["resolved_position"] == 0
         assert execution["data"]["steps"][0]["recorded_position"] == 0
 
-        def reject_pickle_load(_data: bytes) -> Any:
-            raise AssertionError("The safe default must not deserialize pickle data")
+        def reject_dill_load(_data: bytes) -> Any:
+            raise AssertionError("The safe default must not deserialize Dill data")
 
-        data._serializer.loads = reject_pickle_load
+        data._serializer.loads = reject_dill_load
         step = service.inspect_step(int(identifiers["step"]))
         state = step["data"]["step"]["locals"]
         assert state["value"]["value"] == 4
