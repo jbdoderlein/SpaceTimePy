@@ -52,6 +52,7 @@ from typing import Any, TypeVar
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -287,6 +288,11 @@ class FunctionCall(Base):
     stack_snapshots: Mapped[list[StackSnapshot]] = relationship(
         back_populates="function_call", cascade="all, delete-orphan"
     )
+    capture_performance: Mapped[FunctionCallCapturePerformance | None] = relationship(
+        back_populates="function_call",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -301,6 +307,75 @@ class FunctionCall(Base):
         CheckConstraint(
             "caller_call_id IS NULL OR caller_call_id <> id",
             name="ck_function_call_not_own_caller",
+        ),
+    )
+
+
+class FunctionCallCapturePerformance(Base):
+    """Optional capture-overhead measurements for one observed call.
+
+    Durations use a monotonic clock and are stored as integer nanoseconds.
+    They measure recorder work only: profiler bookkeeping and persistence of
+    this row happen after each timed region and are deliberately excluded.
+    Line fields stay zero/null when line capture is not active for the call.
+    """
+
+    __tablename__ = "function_call_capture_performance"
+
+    function_call_id: Mapped[int] = mapped_column(
+        ForeignKey("function_calls.id"), primary_key=True
+    )
+    start_capture_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    return_capture_ns: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+    unwind_capture_ns: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+    line_capture_ns: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    direct_capture_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    inclusive_capture_ns: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    line_event_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    line_snapshot_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    filtered_line_event_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    line_capture_min_ns: Mapped[int | None] = mapped_column(BigInteger)
+    line_capture_max_ns: Mapped[int | None] = mapped_column(BigInteger)
+
+    function_call: Mapped[FunctionCall] = relationship(
+        back_populates="capture_performance"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "start_capture_ns >= 0 AND return_capture_ns >= 0 "
+            "AND unwind_capture_ns >= 0 AND line_capture_ns >= 0 "
+            "AND direct_capture_ns >= 0 "
+            "AND inclusive_capture_ns >= direct_capture_ns",
+            name="ck_function_call_capture_performance_durations",
+        ),
+        CheckConstraint(
+            "direct_capture_ns = start_capture_ns + return_capture_ns "
+            "+ unwind_capture_ns + line_capture_ns",
+            name="ck_function_call_capture_performance_direct_total",
+        ),
+        CheckConstraint(
+            "line_event_count >= 0 AND line_snapshot_count >= 0 "
+            "AND filtered_line_event_count >= 0 "
+            "AND line_snapshot_count + filtered_line_event_count "
+            "= line_event_count",
+            name="ck_function_call_capture_performance_line_counts",
+        ),
+        CheckConstraint(
+            "(line_event_count = 0 AND line_capture_min_ns IS NULL "
+            "AND line_capture_max_ns IS NULL) OR "
+            "(line_event_count > 0 AND line_capture_min_ns >= 0 "
+            "AND line_capture_max_ns >= line_capture_min_ns)",
+            name="ck_function_call_capture_performance_line_range",
         ),
     )
 
@@ -585,6 +660,7 @@ __all__ = [
     "ExecutionStep",
     "ExternalInteractionOccurrence",
     "FunctionCall",
+    "FunctionCallCapturePerformance",
     "FunctionCallOutcome",
     "ObjectIdentity",
     "StackSnapshot",

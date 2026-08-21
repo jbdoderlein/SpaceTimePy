@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from sqlalchemy.orm import Session
 
 import spacetimepy
 from spacetimepy import SpaceTime, get_active_spacetime, open_spacetime
-from spacetimepy.core.model import Base
+from spacetimepy.core.model import Base, FunctionCallCapturePerformance
 from tests.support import SpaceTimeTestCase
 
 
@@ -31,6 +32,82 @@ class TestSpaceTimeRuntime(SpaceTimeTestCase):
             self.assertIsInstance(replacement, SpaceTime)
         finally:
             replacement.close()
+
+    def test_runtime_logging_level_is_scoped_to_the_open_runtime(self) -> None:
+        package_logger = logging.getLogger("spacetimepy")
+        previous_level = package_logger.level
+        self.space.close()
+
+        runtime = SpaceTime.open(logging_level="debug")
+        try:
+            self.assertEqual(package_logger.level, logging.DEBUG)
+        finally:
+            runtime.close()
+
+        self.assertEqual(package_logger.level, previous_level)
+
+    def test_runtime_rejects_an_unknown_logging_level(self) -> None:
+        self.space.close()
+
+        with self.assertRaisesRegex(ValueError, "Unknown logging level"):
+            SpaceTime.open(logging_level="verbose")
+
+    def test_runtime_capture_profile_is_persisted_in_the_trace(self) -> None:
+        self.space.close()
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "performance.db"
+            with SpaceTime.open(database_path, profile_capture=True) as runtime:
+                @runtime.capture.function
+                def calculate(value: int) -> int:
+                    return value + 1
+
+                with runtime.capture.recording():
+                    calculate(2)
+
+            engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+            try:
+                with Session(engine) as database:
+                    performance = database.scalars(
+                        select(FunctionCallCapturePerformance)
+                    ).one()
+                    self.assertGreaterEqual(performance.direct_capture_ns, 0)
+                    self.assertGreaterEqual(
+                        performance.inclusive_capture_ns,
+                        performance.direct_capture_ns,
+                    )
+            finally:
+                engine.dispose()
+
+    def test_runtime_logs_recoverable_capture_failures(self) -> None:
+        self.space.close()
+        runtime = SpaceTime.open(logging_level="WARNING")
+
+        class Unserializable:
+            def __reduce__(self):
+                raise TypeError("no reducer is available")
+
+        @runtime.capture.function
+        def echo(value: Unserializable) -> Unserializable:
+            return value
+
+        try:
+            with (
+                self.assertLogs(
+                    "spacetimepy.core.monitoring",
+                    level="WARNING",
+                ) as captured,
+                runtime.capture.recording() as recording,
+            ):
+                echo(Unserializable())
+
+            messages = "\n".join(captured.output)
+            self.assertIn("could not capture variable 'value'", messages)
+            self.assertIn("could not capture return value", messages)
+            call = runtime.data.get_branch(recording.branch_id).steps[0].function_call
+            self.assertIn("value", call.attributes["capture_errors"])
+            self.assertIn("return", call.attributes["capture_errors"])
+        finally:
+            runtime.close()
 
     def test_close_is_idempotent(self) -> None:
         self.space.close()

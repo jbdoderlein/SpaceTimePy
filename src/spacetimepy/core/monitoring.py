@@ -51,6 +51,7 @@ from .model import (
     StepKind,
     StoredObject,
 )
+from .performance import CallCaptureProfile, CaptureProfiler
 from .serialization import PickleSerializer
 
 if TYPE_CHECKING:
@@ -111,6 +112,7 @@ class _ActiveCall:
     function_call: FunctionCall
     role: CallRole
     current_step: ExecutionStep | None = None
+    capture_profile: CallCaptureProfile | None = None
 
 
 class SpaceTimeMonitor:
@@ -135,6 +137,7 @@ class SpaceTimeMonitor:
         tool_id: int = sys.monitoring.PROFILER_ID,
         flush_batch_size: int = 256,
         serializer: PickleSerializer | None = None,
+        profile_capture: bool = False,
     ) -> SpaceTimeMonitor:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
@@ -147,7 +150,10 @@ class SpaceTimeMonitor:
         tool_id: int = sys.monitoring.PROFILER_ID,
         flush_batch_size: int = 256,
         serializer: PickleSerializer | None = None,
+        profile_capture: bool = False,
     ) -> None:
+        if not isinstance(profile_capture, bool):
+            raise TypeError("profile_capture must be a boolean")
         if getattr(self, "_initialized", False):
             if self.database is not database:
                 raise MonitoringStateError(
@@ -156,6 +162,11 @@ class SpaceTimeMonitor:
             if serializer is not None and self.serializer is not serializer:
                 raise MonitoringStateError(
                     "SpaceTimeMonitor is already initialized with another serializer"
+                )
+            if profile_capture != (self.capture_profiler is not None):
+                raise MonitoringStateError(
+                    "SpaceTimeMonitor is already initialized with another "
+                    "capture-profiling configuration"
                 )
             return
         if flush_batch_size < 0:
@@ -166,6 +177,7 @@ class SpaceTimeMonitor:
         self.tool_id = tool_id
         self.flush_batch_size = flush_batch_size
         self.serializer = serializer or PickleSerializer()
+        self.capture_profiler = CaptureProfiler() if profile_capture else None
         self.is_recording_enabled = True
         self.last_callback_error: BaseException | None = None
 
@@ -308,26 +320,37 @@ class SpaceTimeMonitor:
                 f"sys.monitoring tool ID {self.tool_id} is already used by {tool_name!r}"
             )
 
+        if self.capture_profiler is None:
+            start_callback = self._monitor_callback_function_start
+            return_callback = self._monitor_callback_function_return
+            unwind_callback = self._monitor_callback_function_unwind
+            line_callback = self._monitor_callback_line
+        else:
+            start_callback = self._profiled_monitor_callback_function_start
+            return_callback = self._profiled_monitor_callback_function_return
+            unwind_callback = self._profiled_monitor_callback_function_unwind
+            line_callback = self._profiled_monitor_callback_line
+
         sys.monitoring.set_events(self.tool_id, 0)
         sys.monitoring.register_callback(
             self.tool_id,
             sys.monitoring.events.PY_START,
-            self._monitor_callback_function_start,
+            start_callback,
         )
         sys.monitoring.register_callback(
             self.tool_id,
             sys.monitoring.events.PY_RETURN,
-            self._monitor_callback_function_return,
+            return_callback,
         )
         sys.monitoring.register_callback(
             self.tool_id,
             sys.monitoring.events.PY_UNWIND,
-            self._monitor_callback_function_unwind,
+            unwind_callback,
         )
         sys.monitoring.register_callback(
             self.tool_id,
             sys.monitoring.events.LINE,
-            self._monitor_callback_line,
+            line_callback,
         )
 
     def _uninstall_monitoring_tool(self) -> None:
@@ -503,6 +526,236 @@ class SpaceTimeMonitor:
         finally:
             self._inside_callback = False
 
+    def _profiled_monitor_callback_function_start(
+        self,
+        code: types.CodeType,
+        instruction_offset: int,
+    ) -> None:
+        """Profile the start callback without changing the disabled hot path."""
+
+        registration = self._captures.get(code)
+        if (
+            registration is None
+            or not self.is_recording_enabled
+            or self.current_branch is None
+            or self._inside_callback
+        ):
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None or id(frame) in self._active_calls_by_frame:
+            return
+        if (
+            registration.role == CallRole.EXTERNAL_INTERACTION
+            and self._nearest_owner_step(frame.f_back) is None
+        ):
+            return
+
+        profiler = self.capture_profiler
+        if profiler is None:  # pragma: no cover - callback selected at installation
+            return
+        parent_profile = (
+            self._active_calls[-1].capture_profile if self._active_calls else None
+        )
+        started_ns = profiler.begin()
+        self._inside_callback = True
+        try:
+            attributes = self._call_start_attributes(
+                registration, frame, instruction_offset
+            )
+            function_call = self.record_function_start(
+                frame,
+                code=code,
+                instruction_offset=instruction_offset,
+                role=registration.role,
+                ignored_names=registration.ignored_names,
+                attributes=attributes,
+            )
+            capture_ns = profiler.finish(started_ns)
+            if function_call is not None:
+                active = self._active_calls_by_frame[id(frame)]
+                active.capture_profile = profiler.start_call(
+                    function_call,
+                    parent=parent_profile,
+                    capture_ns=capture_ns,
+                )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def _profiled_monitor_callback_function_return(
+        self,
+        code: types.CodeType,
+        instruction_offset: int,
+        return_value: Any,
+    ) -> None:
+        """Profile a normal-return callback and close its accumulator."""
+
+        if self._inside_callback:
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None:
+            return
+        active = self._active_calls_by_frame.get(id(frame))
+        if active is None or active.capture_profile is None:
+            return
+
+        profiler = self.capture_profiler
+        if profiler is None:  # pragma: no cover - callback selected at installation
+            return
+        started_ns = profiler.begin()
+        self._inside_callback = True
+        try:
+            registration = self._captures.get(code)
+            attributes = self._call_return_attributes(
+                registration,
+                frame,
+                code,
+                instruction_offset,
+                return_value,
+            )
+            self.record_function_return(
+                frame,
+                return_value,
+                attributes=attributes,
+            )
+            capture_ns = profiler.finish(started_ns)
+            profiler.finish_call(
+                active.capture_profile,
+                capture_ns=capture_ns,
+                raised=False,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def _profiled_monitor_callback_function_unwind(
+        self,
+        code: types.CodeType,
+        instruction_offset: int,
+        exception: BaseException,
+    ) -> None:
+        """Profile an unwind callback and close its accumulator."""
+
+        if self._inside_callback:
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None:
+            return
+        active = self._active_calls_by_frame.get(id(frame))
+        if active is None or active.capture_profile is None:
+            return
+
+        profiler = self.capture_profiler
+        if profiler is None:  # pragma: no cover - callback selected at installation
+            return
+        started_ns = profiler.begin()
+        self._inside_callback = True
+        try:
+            registration = self._captures.get(code)
+            attributes = self._call_return_attributes(
+                registration,
+                frame,
+                code,
+                instruction_offset,
+                exception,
+            )
+            self.record_function_unwind(
+                frame,
+                exception,
+                attributes=attributes,
+            )
+            capture_ns = profiler.finish(started_ns)
+            profiler.finish_call(
+                active.capture_profile,
+                capture_ns=capture_ns,
+                raised=True,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
+    def _profiled_monitor_callback_line(
+        self,
+        code: types.CodeType,
+        line_number: int,
+    ) -> None:
+        """Profile selected snapshots and rejected line-selection events."""
+
+        registration = self._captures.get(code)
+        if (
+            registration is None
+            or not registration.capture_lines
+            or not self.is_recording_enabled
+            or self.current_branch is None
+            or self._inside_callback
+        ):
+            return
+
+        active = self._active_calls[-1] if self._active_calls else None
+        if (
+            active is None
+            or active.code is not code
+            or active.capture_profile is None
+        ):
+            return
+        profiler = self.capture_profiler
+        if profiler is None:  # pragma: no cover - callback selected at installation
+            return
+
+        started_ns = profiler.begin()
+        if (
+            registration.line_numbers is not None
+            and line_number not in registration.line_numbers
+        ):
+            capture_ns = profiler.finish(started_ns)
+            profiler.record_line(
+                active.capture_profile,
+                capture_ns=capture_ns,
+                snapshot_recorded=False,
+            )
+            return
+
+        callback_frame = inspect.currentframe()
+        frame = callback_frame.f_back if callback_frame is not None else None
+        del callback_frame
+        if frame is None or id(frame) not in self._active_calls_by_frame:
+            return
+
+        self._inside_callback = True
+        try:
+            attributes = self._call_line_attributes(
+                registration, frame, line_number
+            )
+            snapshot = self.record_stack_snapshot(
+                frame,
+                line_number,
+                code=code,
+                ignored_names=registration.ignored_names,
+                attributes=attributes,
+            )
+            capture_ns = profiler.finish(started_ns)
+            profiler.record_line(
+                active.capture_profile,
+                capture_ns=capture_ns,
+                snapshot_recorded=snapshot is not None,
+            )
+        except BaseException as error:  # callbacks must not alter user execution
+            self._handle_callback_error(error)
+        finally:
+            self._inside_callback = False
+
     def start_branch(self, branch: ExecutionBranch) -> ExecutionBranch:
         """Attach the recorder to an existing or newly constructed branch.
 
@@ -670,6 +923,12 @@ class SpaceTimeMonitor:
                 f"Replacement line {line_number} is not selected for capture"
             )
 
+        profiler = self.capture_profiler
+        started_ns = (
+            profiler.begin()
+            if profiler is not None and active.capture_profile is not None
+            else None
+        )
         attributes = self._call_line_attributes(
             registration,
             frame,
@@ -689,6 +948,17 @@ class SpaceTimeMonitor:
             registration,
             line_numbers=selected_lines,
         )
+        if (
+            profiler is not None
+            and active.capture_profile is not None
+            and started_ns is not None
+        ):
+            capture_ns = profiler.finish(started_ns)
+            profiler.record_line(
+                active.capture_profile,
+                capture_ns=capture_ns,
+                snapshot_recorded=True,
+            )
         return snapshot
 
     def finish_branch(
@@ -714,6 +984,8 @@ class SpaceTimeMonitor:
         branch.completed_at = (
             None if status == ExecutionStatus.OPEN else self._now()
         )
+        if self.capture_profiler is not None:
+            self.capture_profiler.persist(self.database)
         self.database.flush()
         if commit:
             self.database.commit()
@@ -751,6 +1023,8 @@ class SpaceTimeMonitor:
 
     def rollback(self) -> None:
         self.database.rollback()
+        if self.capture_profiler is not None:
+            self.capture_profiler.discard()
         self._pending_events = 0
         self._active_calls.clear()
         self._active_calls_by_frame.clear()
@@ -772,6 +1046,8 @@ class SpaceTimeMonitor:
 
         self._active_calls.clear()
         self._active_calls_by_frame.clear()
+        if self.capture_profiler is not None:
+            self.capture_profiler.discard()
         self._step_activation_listeners.clear()
         self.current_branch = None
         self.current_session = None
@@ -963,6 +1239,7 @@ class SpaceTimeMonitor:
             return_ref = self._store_value(return_value)
         except Exception as error:  # noqa: BLE001 - capture must not hide the call
             return_error = f"{type(error).__name__}: {error}"
+            self._log_capture_failure("return value", return_value, error)
 
         call.return_ref = return_ref
         call.exception_ref = None
@@ -995,6 +1272,7 @@ class SpaceTimeMonitor:
             exception_ref = self._store_value(exception)
         except Exception as error:  # noqa: BLE001 - capture must not hide the call
             exception_error = f"{type(error).__name__}: {error}"
+            self._log_capture_failure("raised exception", exception, error)
 
         call.return_ref = None
         call.exception_ref = exception_ref
@@ -1184,6 +1462,13 @@ class SpaceTimeMonitor:
         try:
             attributes = invoke()
         except BaseException as error:  # interface hook must not alter execution
+            logger.warning(
+                "SpaceTimePy capture attribute provider %s failed: %s: %s",
+                provider_name,
+                type(error).__name__,
+                error,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
             return {
                 "capture_errors": {
                     provider_name: f"{type(error).__name__}: {error}"
@@ -1192,6 +1477,12 @@ class SpaceTimeMonitor:
         if attributes is None:
             return None
         if not isinstance(attributes, Mapping):
+            logger.warning(
+                "SpaceTimePy capture attribute provider %s returned %s instead "
+                "of a mapping",
+                provider_name,
+                type(attributes).__name__,
+            )
             return {
                 "capture_errors": {
                     provider_name: "attribute provider did not return a mapping"
@@ -1242,6 +1533,7 @@ class SpaceTimeMonitor:
                 references[name] = self._store_value(value)
             except Exception as error:  # noqa: BLE001 - record other variables
                 errors[name] = f"{type(error).__name__}: {error}"
+                self._log_capture_failure(f"variable {name!r}", value, error)
 
         return references, errors
 
@@ -1305,6 +1597,22 @@ class SpaceTimeMonitor:
         self.database.add(stored)
         self._stored_value_cache[cache_key] = object_reference
         return object_reference
+
+    @staticmethod
+    def _log_capture_failure(
+        value_label: str,
+        value: Any,
+        error: BaseException,
+    ) -> None:
+        type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+        logger.warning(
+            "SpaceTimePy could not capture %s of type %s: %s: %s",
+            value_label,
+            type_name,
+            type(error).__name__,
+            error,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
 
     def _store_code_definition(self, code: types.CodeType) -> str | None:
         if code in self._code_definition_cache:

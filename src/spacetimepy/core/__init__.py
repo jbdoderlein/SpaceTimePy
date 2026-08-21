@@ -14,6 +14,7 @@ from .model import (
     ExecutionStep,
     ExternalInteractionOccurrence,
     FunctionCall,
+    FunctionCallCapturePerformance,
     FunctionCallOutcome,
     ObjectIdentity,
     StackSnapshot,
@@ -26,6 +27,7 @@ from .monitoring import (
     MonitoringStateError,
     SpaceTimeMonitor,
 )
+from .performance import CallCaptureProfile, CaptureProfiler
 from .serialization import (
     CustomPickler,
     CustomPicklerError,
@@ -40,6 +42,8 @@ __all__ = [
     "Base",
     "CallRole",
     "CaptureRegistration",
+    "CallCaptureProfile",
+    "CaptureProfiler",
     "CodeDefinition",
     "CodeObjectLink",
     "CustomPickler",
@@ -52,6 +56,7 @@ __all__ = [
     "ExecutionStep",
     "ExternalInteractionOccurrence",
     "FunctionCall",
+    "FunctionCallCapturePerformance",
     "FunctionCallOutcome",
     "MonitoringStateError",
     "ObjectIdentity",

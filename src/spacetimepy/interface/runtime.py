@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,36 @@ if TYPE_CHECKING:
 
 
 _active_runtime: SpaceTime | None = None
+_PACKAGE_LOGGER_NAME = "spacetimepy"
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _resolve_logging_level(level: int | str | None) -> int | None:
+    if level is None:
+        return None
+    if isinstance(level, bool):
+        raise TypeError("logging_level must be an integer, level name, or None")
+    if isinstance(level, int):
+        return level
+    if not isinstance(level, str):
+        raise TypeError("logging_level must be an integer, level name, or None")
+
+    normalized = level.strip().upper()
+    resolved = logging.getLevelNamesMapping().get(normalized)
+    if resolved is None:
+        valid_names = ", ".join(
+            name for name in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+        )
+        raise ValueError(
+            f"Unknown logging level {level!r}; expected one of {valid_names}"
+        )
+    return resolved
+
+
+def _validate_profile_capture(value: bool) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("profile_capture must be a boolean")
+    return value
 
 
 class SpaceTime:
@@ -47,15 +78,20 @@ class SpaceTime:
         flush_batch_size: int = 256,
         tool_id: int | None = None,
         custom_picklers: Iterable[CustomPickler] = (),
+        logging_level: int | str | None = None,
+        profile_capture: bool = False,
     ) -> None:
         global _active_runtime
         if _active_runtime is not None and not _active_runtime.is_closed:
             raise RuntimeError("A SpaceTime runtime is already active in this process")
 
+        resolved_logging_level = _resolve_logging_level(logging_level)
+        profile_capture = _validate_profile_capture(profile_capture)
         self._serializer = PickleSerializer(custom_picklers)
         monitor_options: dict[str, Any] = {
             "flush_batch_size": flush_batch_size,
             "serializer": self._serializer,
+            "profile_capture": profile_capture,
         }
         if tool_id is not None:
             monitor_options["tool_id"] = tool_id
@@ -69,6 +105,12 @@ class SpaceTime:
         self._standard_external_interactions = StandardExternalInteractionRegistry(
             self._monitor
         )
+        self._package_logger = logging.getLogger(_PACKAGE_LOGGER_NAME)
+        self._previous_logging_level = self._package_logger.level
+        self._logging_handler: logging.Handler | None = None
+        self._logging_configured = resolved_logging_level is not None
+        if resolved_logging_level is not None:
+            self._configure_logging(resolved_logging_level)
         try:
             self._standard_external_interactions.start()
             self.capture = CaptureInterface(
@@ -89,6 +131,7 @@ class SpaceTime:
         except BaseException:
             self._standard_external_interactions.stop()
             self._monitor.shutdown(commit=False)
+            self._restore_logging()
             raise
 
     @classmethod
@@ -101,9 +144,19 @@ class SpaceTime:
         flush_batch_size: int = 256,
         tool_id: int | None = None,
         custom_picklers: Iterable[CustomPickler] = (),
+        logging_level: int | str | None = None,
+        profile_capture: bool = False,
     ) -> SpaceTime:
-        """Open a SQLite path/URL and create a complete SpaceTime runtime."""
+        """Open a SQLite path/URL and create a complete SpaceTime runtime.
 
+        ``logging_level`` accepts a standard logging name such as ``"INFO"``
+        or an integer level. When supplied, SpaceTimePy diagnostics are enabled
+        for this runtime and recoverable capture failures are logged.
+        ``profile_capture`` stores opt-in per-call capture-overhead metrics.
+        """
+
+        resolved_logging_level = _resolve_logging_level(logging_level)
+        profile_capture = _validate_profile_capture(profile_capture)
         url = cls._database_url(database)
         engine_options: dict[str, Any] = {"echo": echo}
         if url.startswith("sqlite"):
@@ -120,6 +173,8 @@ class SpaceTime:
                 flush_batch_size=flush_batch_size,
                 tool_id=tool_id,
                 custom_picklers=custom_picklers,
+                logging_level=resolved_logging_level,
+                profile_capture=profile_capture,
             )
         except BaseException:
             orm_session.close()
@@ -135,9 +190,13 @@ class SpaceTime:
         flush_batch_size: int = 256,
         tool_id: int | None = None,
         custom_picklers: Iterable[CustomPickler] = (),
+        logging_level: int | str | None = None,
+        profile_capture: bool = False,
     ) -> SpaceTime:
         """Build the public interfaces around an application-owned session."""
 
+        resolved_logging_level = _resolve_logging_level(logging_level)
+        profile_capture = _validate_profile_capture(profile_capture)
         if create_schema:
             bind = database.get_bind()
             Base.metadata.create_all(bind)
@@ -147,6 +206,8 @@ class SpaceTime:
             flush_batch_size=flush_batch_size,
             tool_id=tool_id,
             custom_picklers=custom_picklers,
+            logging_level=resolved_logging_level,
+            profile_capture=profile_capture,
         )
 
     @property
@@ -186,6 +247,7 @@ class SpaceTime:
         self._closed = True
         if _active_runtime is self:
             _active_runtime = None
+        self._restore_logging()
 
     def __enter__(self) -> SpaceTime:
         self._ensure_open()
@@ -213,6 +275,28 @@ class SpaceTime:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("This SpaceTime runtime is closed")
+
+    def _configure_logging(self, level: int) -> None:
+        self._package_logger.setLevel(level)
+        if self._package_logger.hasHandlers():
+            return
+
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+        self._package_logger.addHandler(handler)
+        self._logging_handler = handler
+
+    def _restore_logging(self) -> None:
+        if not self._logging_configured:
+            return
+        handler = self._logging_handler
+        if handler is not None:
+            self._package_logger.removeHandler(handler)
+            handler.close()
+            self._logging_handler = None
+        self._package_logger.setLevel(self._previous_logging_level)
+        self._logging_configured = False
 
 
 def open_spacetime(

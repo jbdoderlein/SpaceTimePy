@@ -264,6 +264,41 @@ mcp = spacetimepy.create_mcp_server("trace.db")
 mcp.run()
 ```
 
+## Runtime diagnostics
+
+Pass a standard Python logging level when opening SpaceTime to enable runtime
+diagnostics for the `spacetimepy` logger hierarchy:
+
+```python
+import spacetimepy
+
+space = spacetimepy.SpaceTime.open("trace.db", logging_level="INFO")
+```
+
+Integer levels such as `logging.DEBUG` are also accepted. Recoverable capture
+failures are logged at `WARNING`; at `DEBUG`, their exception traceback is
+included. The failed value is still omitted from the trace and described in
+the VM record's `attributes["capture_errors"]`, so logging does not change the
+captured program's behavior. If the application already configured Python
+logging, SpaceTimePy uses those handlers; otherwise it installs a temporary
+standard-error handler for the lifetime of the runtime.
+
+## Capture performance profiling
+
+Capture-overhead profiling is opt-in and disabled by default:
+
+```python
+space = spacetimepy.SpaceTime.open("trace.db", profile_capture=True)
+```
+
+When enabled, SpaceTimePy stores one `FunctionCallCapturePerformance` row for
+each completed captured call. It contains direct and inclusive capture time in
+integer nanoseconds, separate return and unwind costs, and aggregate line-event
+counts and timings when line capture is active. Measurements stop before
+profiler bookkeeping, and performance rows are kept in memory until branch
+finalization so persisting them is not included in callback timings. The
+programmatic data interface for these rows will be added separately.
+
 ## Capture hooks
 
 Start and return hooks can derive JSON metadata from a captured invocation.

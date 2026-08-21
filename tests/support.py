@@ -37,10 +37,12 @@ class DatabaseTestCase(unittest.TestCase):
         self,
         *,
         flush_batch_size: int = 256,
+        profile_capture: bool = False,
     ) -> SpaceTimeMonitor:
         return SpaceTimeMonitor(
             self.database,
             flush_batch_size=flush_batch_size,
+            profile_capture=profile_capture,
         )
 
     def start_branch(
