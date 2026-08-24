@@ -213,6 +213,7 @@ class CaptureDeclaration:
     role: CallRole
     capture_lines: bool = False
     line_numbers: frozenset[int] | None = None
+    max_snapshots_per_line: int | None = None
     ignored_names: frozenset[str] = frozenset()
     start_attributes: StartAttributes | None = None
     return_attributes: ReturnAttributes | None = None
@@ -235,6 +236,7 @@ class CaptureDeclaration:
             role=self.role,
             capture_lines=self.capture_lines,
             line_numbers=self.line_numbers,
+            max_snapshots_per_line=self.max_snapshots_per_line,
             ignored_names=self.ignored_names,
             start_attributes=_combine_start_attributes(
                 self.start_attributes,
@@ -314,12 +316,22 @@ class CaptureRegistry:
 capture_registry = CaptureRegistry()
 
 
+def _validate_max_snapshots_per_line(value: int | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("max_snapshots_per_line must be an integer or None")
+    if value < 1:
+        raise ValueError("max_snapshots_per_line must be positive")
+
+
 def _declare_capture[Target: Callable[..., Any]](
     target: Target | None,
     *,
     role: CallRole,
     capture_lines: bool = False,
     lines: Collection[int] | None = None,
+    max_snapshots_per_line: int | None = None,
     ignored_names: Collection[str] = (),
     start_attributes: StartAttributes | None = None,
     return_attributes: ReturnAttributes | None = None,
@@ -327,6 +339,7 @@ def _declare_capture[Target: Callable[..., Any]](
     start_hooks: Iterable[StartHook] = (),
     return_hooks: Iterable[ReturnHook] = (),
 ) -> Target | Callable[[Target], Target]:
+    _validate_max_snapshots_per_line(max_snapshots_per_line)
     selected_start_hooks = tuple(start_hooks)
     selected_return_hooks = tuple(return_hooks)
 
@@ -337,6 +350,7 @@ def _declare_capture[Target: Callable[..., Any]](
                 role=role,
                 capture_lines=capture_lines,
                 line_numbers=None if lines is None else frozenset(lines),
+                max_snapshots_per_line=max_snapshots_per_line,
                 ignored_names=frozenset(ignored_names),
                 start_attributes=start_attributes,
                 return_attributes=return_attributes,
@@ -402,6 +416,7 @@ def line[Target: Callable[..., Any]](
     /,
     *,
     lines: Collection[int] | None = None,
+    max_snapshots_per_line: int | None = None,
     ignored_names: Collection[str] = (),
     start_attributes: StartAttributes | None = None,
     return_attributes: ReturnAttributes | None = None,
@@ -416,6 +431,7 @@ def line[Target: Callable[..., Any]](
         role=CallRole.STEP,
         capture_lines=True,
         lines=lines,
+        max_snapshots_per_line=max_snapshots_per_line,
         ignored_names=ignored_names,
         start_attributes=start_attributes,
         return_attributes=return_attributes,
@@ -612,6 +628,7 @@ class CaptureInterface:
         /,
         *,
         lines: Collection[int] | None = None,
+        max_snapshots_per_line: int | None = None,
         ignored_names: Collection[str] = (),
         start_attributes: StartAttributes | None = None,
         return_attributes: ReturnAttributes | None = None,
@@ -621,6 +638,7 @@ class CaptureInterface:
     ) -> CapturedCallable | Callable[[CapturedCallable], CapturedCallable]:
         """Capture selected line states of the decorated function as steps."""
 
+        _validate_max_snapshots_per_line(max_snapshots_per_line)
         combined_start_attributes = _combine_start_attributes(
             start_attributes,
             tuple(start_hooks),
@@ -636,6 +654,7 @@ class CaptureInterface:
                 role=CallRole.STEP,
                 capture_lines=True,
                 line_numbers=lines,
+                max_snapshots_per_line=max_snapshots_per_line,
                 ignored_names=ignored_names,
                 start_attributes=combined_start_attributes,
                 return_attributes=combined_return_attributes,

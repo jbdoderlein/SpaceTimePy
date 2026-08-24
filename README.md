@@ -24,6 +24,23 @@ space.close()
 Opening the runtime installs all process-level declarations. Functions are
 only persisted while a recording or replay branch is active.
 
+Use `max_snapshots_per_line` to limit repeated snapshots from loops:
+
+```python
+@spacetimepy.line(max_snapshots_per_line=100)
+def calculate(values):
+    total = 0
+    for value in values:
+        total += value
+    return total
+```
+
+The limit applies separately to each function call. SpaceTimePy stores the
+first 100 snapshots for each line. It ignores later snapshots for that line.
+The function-call attributes contain one `line_capture_limit` summary when
+SpaceTimePy ignores snapshots. The summary contains the captured and ignored
+counts. A value of `None` keeps line capture unlimited.
+
 In-process integrations can discover the user-owned runtime without importing
 core monitoring state:
 
@@ -296,9 +313,10 @@ each completed captured call. It contains direct and inclusive capture time in
 integer nanoseconds, separate return and unwind costs, and aggregate line-event
 counts and timings when line capture is active. Measurements stop before
 profiler bookkeeping, and performance rows are kept in memory until branch
-finalization so persisting them is not included in callback timings. The
-programmatic interface exposes the optional metrics on each call and through
-dedicated queries:
+finalization so persisting them is not included in callback timings. Filtered
+line events include selection rejections and snapshots ignored by a line
+limit. The programmatic interface exposes the optional metrics on each call
+and through dedicated queries:
 
 ```python
 call = space.data.get_function_call(call_id)

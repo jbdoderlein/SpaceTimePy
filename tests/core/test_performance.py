@@ -141,6 +141,44 @@ class TestCapturePerformance(DatabaseTestCase):
         self.assertEqual(performance.line_capture_min_ns, clock.increment_ns)
         self.assertEqual(performance.line_capture_max_ns, clock.increment_ns)
 
+    def test_line_limit_counts_ignored_callbacks_without_extra_snapshots(self) -> None:
+        monitor = self.create_monitor(profile_capture=True)
+        clock = IncrementingClock()
+        monitor.capture_profiler._clock = clock
+        self.start_branch(monitor, kind=StepKind.STACK_SNAPSHOT)
+
+        def calculate(iterations: int) -> int:
+            total = 0
+            for index in range(iterations):
+                total += index
+            return total
+
+        selected_line = calculate.__code__.co_firstlineno + 3
+        monitor.register_capture(
+            calculate,
+            role=CallRole.STEP,
+            capture_lines=True,
+            line_numbers={selected_line},
+            max_snapshots_per_line=2,
+        )
+        self.assertEqual(calculate(6), 15)
+        monitor.finish_branch()
+
+        call = self.database.scalars(select(FunctionCall)).one()
+        performance = self.database.scalars(
+            select(FunctionCallCapturePerformance)
+        ).one()
+        snapshots = self.database.scalars(select(StackSnapshot)).all()
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(performance.line_snapshot_count, 2)
+        self.assertEqual(
+            performance.filtered_line_event_count,
+            performance.line_event_count - 2,
+        )
+        summary = call.attributes["line_capture_limit"]
+        self.assertEqual(summary["lines"][0]["captured"], 2)
+        self.assertEqual(summary["lines"][0]["ignored"], 4)
+
     def test_unwind_cost_is_kept_separate_from_normal_return(self) -> None:
         monitor = self.create_monitor(profile_capture=True)
         clock = IncrementingClock()

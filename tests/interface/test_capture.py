@@ -170,6 +170,37 @@ class TestCaptureInterface(SpaceTimeTestCase):
             selected_line,
         )
 
+    def test_line_decorator_limits_snapshots_for_each_call(self) -> None:
+        def calculate(iterations: int) -> int:
+            total = 0
+            for index in range(iterations):
+                total += index
+            return total
+
+        selected_line = calculate.__code__.co_firstlineno + 3
+        calculate = self.space.capture.line(
+            lines={selected_line},
+            max_snapshots_per_line=2,
+        )(calculate)
+        with self.space.capture.recording(mode=CaptureMode.LINE) as recording:
+            self.assertEqual(calculate(4), 6)
+
+        steps = self.space.data.get_branch(recording.branch_id).steps
+        self.assertEqual(len(steps), 2)
+        call = self.space.data.get_function_call(
+            steps[0].stack_snapshot.function_call_id
+        )
+        summary = call.attributes["line_capture_limit"]
+        self.assertEqual(summary["maximum_per_line"], 2)
+        self.assertEqual(summary["lines"][0]["captured"], 2)
+        self.assertEqual(summary["lines"][0]["ignored"], 2)
+
+    def test_line_decorator_rejects_invalid_snapshot_limits(self) -> None:
+        with self.assertRaisesRegex(TypeError, "must be an integer or None"):
+            self.space.capture.line(max_snapshots_per_line=True)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            self.space.capture.line(max_snapshots_per_line=-1)
+
     def test_uncaught_program_exception_marks_recording_failed(self) -> None:
         @self.space.capture.function
         def explode() -> None:

@@ -99,10 +99,19 @@ class CaptureRegistration:
     role: CallRole
     capture_lines: bool = False
     line_numbers: frozenset[int] | None = None
+    max_snapshots_per_line: int | None = None
     ignored_names: frozenset[str] = frozenset()
     start_attributes: StartAttributes | None = None
     return_attributes: ReturnAttributes | None = None
     line_attributes: LineAttributes | None = None
+
+
+@dataclass(slots=True)
+class _LineCaptureCount:
+    """Count stored and ignored snapshots for one code line."""
+
+    captured: int = 0
+    ignored: int = 0
 
 
 @dataclass
@@ -113,6 +122,10 @@ class _ActiveCall:
     role: CallRole
     current_step: ExecutionStep | None = None
     capture_profile: CallCaptureProfile | None = None
+    max_snapshots_per_line: int | None = None
+    line_capture_counts: dict[tuple[types.CodeType, int], _LineCaptureCount] | None = (
+        None
+    )
 
 
 class SpaceTimeMonitor:
@@ -238,6 +251,7 @@ class SpaceTimeMonitor:
         role: CallRole = CallRole.STEP,
         capture_lines: bool = False,
         line_numbers: Collection[int] | None = None,
+        max_snapshots_per_line: int | None = None,
         ignored_names: Collection[str] = (),
         start_attributes: StartAttributes | None = None,
         return_attributes: ReturnAttributes | None = None,
@@ -255,6 +269,15 @@ class SpaceTimeMonitor:
             None if line_numbers is None else frozenset(line_numbers)
         )
         capture_lines = capture_lines or selected_lines is not None
+        if max_snapshots_per_line is not None:
+            if isinstance(max_snapshots_per_line, bool) or not isinstance(
+                max_snapshots_per_line, int
+            ):
+                raise TypeError("max_snapshots_per_line must be an integer or None")
+            if max_snapshots_per_line < 1:
+                raise ValueError("max_snapshots_per_line must be positive")
+            if not capture_lines:
+                raise ValueError("max_snapshots_per_line requires line capture")
         if role == CallRole.EXTERNAL_INTERACTION and capture_lines:
             raise ValueError("External interaction captures cannot include line events")
 
@@ -263,6 +286,7 @@ class SpaceTimeMonitor:
             role=role,
             capture_lines=capture_lines,
             line_numbers=selected_lines,
+            max_snapshots_per_line=max_snapshots_per_line,
             ignored_names=frozenset(ignored_names),
             start_attributes=start_attributes,
             return_attributes=return_attributes,
@@ -407,6 +431,7 @@ class SpaceTimeMonitor:
                 instruction_offset=instruction_offset,
                 role=registration.role,
                 ignored_names=registration.ignored_names,
+                max_snapshots_per_line=registration.max_snapshots_per_line,
                 attributes=attributes,
             )
         except BaseException as error:  # callbacks must not alter user execution
@@ -503,6 +528,24 @@ class SpaceTimeMonitor:
         ):
             return
 
+        line_count = None
+        if registration.max_snapshots_per_line is not None:
+            active = self._active_calls[-1] if self._active_calls else None
+            if (
+                active is None
+                or active.code is not code
+                or active.line_capture_counts is None
+            ):
+                return
+            key = (code, line_number)
+            line_count = active.line_capture_counts.get(key)
+            if line_count is None:
+                line_count = _LineCaptureCount()
+                active.line_capture_counts[key] = line_count
+            if line_count.captured >= registration.max_snapshots_per_line:
+                line_count.ignored += 1
+                return
+
         callback_frame = inspect.currentframe()
         frame = callback_frame.f_back if callback_frame is not None else None
         del callback_frame
@@ -514,13 +557,15 @@ class SpaceTimeMonitor:
             attributes = self._call_line_attributes(
                 registration, frame, line_number
             )
-            self.record_stack_snapshot(
+            snapshot = self.record_stack_snapshot(
                 frame,
                 line_number,
                 code=code,
                 ignored_names=registration.ignored_names,
                 attributes=attributes,
             )
+            if snapshot is not None and line_count is not None:
+                line_count.captured += 1
         except BaseException as error:  # callbacks must not alter user execution
             self._handle_callback_error(error)
         finally:
@@ -571,6 +616,7 @@ class SpaceTimeMonitor:
                 instruction_offset=instruction_offset,
                 role=registration.role,
                 ignored_names=registration.ignored_names,
+                max_snapshots_per_line=registration.max_snapshots_per_line,
                 attributes=attributes,
             )
             capture_ns = profiler.finish(started_ns)
@@ -727,6 +773,25 @@ class SpaceTimeMonitor:
             )
             return
 
+        line_count = None
+        if registration.max_snapshots_per_line is not None:
+            if active.line_capture_counts is None:
+                return
+            key = (code, line_number)
+            line_count = active.line_capture_counts.get(key)
+            if line_count is None:
+                line_count = _LineCaptureCount()
+                active.line_capture_counts[key] = line_count
+            if line_count.captured >= registration.max_snapshots_per_line:
+                line_count.ignored += 1
+                capture_ns = profiler.finish(started_ns)
+                profiler.record_line(
+                    active.capture_profile,
+                    capture_ns=capture_ns,
+                    snapshot_recorded=False,
+                )
+                return
+
         callback_frame = inspect.currentframe()
         frame = callback_frame.f_back if callback_frame is not None else None
         del callback_frame
@@ -745,6 +810,8 @@ class SpaceTimeMonitor:
                 ignored_names=registration.ignored_names,
                 attributes=attributes,
             )
+            if snapshot is not None and line_count is not None:
+                line_count.captured += 1
             capture_ns = profiler.finish(started_ns)
             profiler.record_line(
                 active.capture_profile,
@@ -943,6 +1010,13 @@ class SpaceTimeMonitor:
         )
         if snapshot is None:
             raise MonitoringStateError("The replacement snapshot was not recorded")
+        if active.line_capture_counts is not None:
+            key = (frame.f_code, line_number)
+            line_count = active.line_capture_counts.get(key)
+            if line_count is None:
+                line_count = _LineCaptureCount()
+                active.line_capture_counts[key] = line_count
+            line_count.captured += 1
 
         self._captures[active.code] = replace(
             registration,
@@ -1062,6 +1136,7 @@ class SpaceTimeMonitor:
         instruction_offset: int | None = None,
         role: CallRole = CallRole.SUPPORT,
         ignored_names: Collection[str] = (),
+        max_snapshots_per_line: int | None = None,
         attributes: Mapping[str, Any] | None = None,
         source_step: ExecutionStep | None = None,
     ) -> FunctionCall | None:
@@ -1135,6 +1210,10 @@ class SpaceTimeMonitor:
             code=code,
             function_call=function_call,
             role=role,
+            max_snapshots_per_line=max_snapshots_per_line,
+            line_capture_counts=(
+                {} if max_snapshots_per_line is not None else None
+            ),
         )
         self._active_calls.append(active)
         self._active_calls_by_frame[frame_id] = active
@@ -1246,6 +1325,7 @@ class SpaceTimeMonitor:
         call.outcome = FunctionCallOutcome.RETURNED
         call.completed_at = self._now()
         self._merge_call_attributes(call, attributes, "return", return_error)
+        self._store_line_capture_limit(active)
 
         self._remove_active(active)
         self._mark_event_recorded()
@@ -1279,6 +1359,7 @@ class SpaceTimeMonitor:
         call.outcome = FunctionCallOutcome.RAISED
         call.completed_at = self._now()
         self._merge_call_attributes(call, attributes, "exception", exception_error)
+        self._store_line_capture_limit(active)
 
         self._remove_active(active)
         self._mark_event_recorded()
@@ -1394,6 +1475,44 @@ class SpaceTimeMonitor:
             errors[error_kind] = capture_error
             merged["capture_errors"] = errors
         call.attributes = merged
+
+    def _store_line_capture_limit(self, active: _ActiveCall) -> None:
+        """Store one summary when a line limit ignored snapshots."""
+
+        if (
+            active.max_snapshots_per_line is None
+            or not active.line_capture_counts
+        ):
+            return
+        limited_lines = [
+            (code, line_number, count)
+            for (code, line_number), count in active.line_capture_counts.items()
+            if count.ignored > 0
+        ]
+        if not limited_lines:
+            return
+        limited_lines.sort(
+            key=lambda item: (
+                item[0].co_filename,
+                item[0].co_firstlineno,
+                item[0].co_qualname,
+                item[1],
+            )
+        )
+        attributes = dict(active.function_call.attributes)
+        attributes["line_capture_limit"] = {
+            "maximum_per_line": active.max_snapshots_per_line,
+            "lines": [
+                {
+                    "code_definition_id": self._store_code_definition(code),
+                    "line_number": line_number,
+                    "captured": count.captured,
+                    "ignored": count.ignored,
+                }
+                for code, line_number, count in limited_lines
+            ],
+        }
+        active.function_call.attributes = attributes
 
     def _mark_event_recorded(self) -> None:
         self._pending_events += 1

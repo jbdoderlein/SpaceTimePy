@@ -47,6 +47,39 @@ class TestDeclarativeCapture(SpaceTimeTestCase):
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0].stack_snapshot.line_number, selected_line)
 
+    def test_line_declaration_keeps_snapshot_limit_before_runtime_opens(self) -> None:
+        self.space.close()
+
+        def calculate(iterations: int) -> int:
+            total = 0
+            for index in range(iterations):
+                total += index
+            return total
+
+        selected_line = calculate.__code__.co_firstlineno + 3
+        calculate = spacetimepy.line(
+            lines={selected_line},
+            max_snapshots_per_line=2,
+        )(calculate)
+
+        self.space = SpaceTime.open()
+        with self.space.capture.recording(mode=CaptureMode.LINE) as recording:
+            self.assertEqual(calculate(5), 10)
+
+        steps = self.space.data.get_branch(recording.branch_id).steps
+        self.assertEqual(len(steps), 2)
+        call = self.space.data.get_function_call(
+            steps[0].stack_snapshot.function_call_id
+        )
+        summary = call.attributes["line_capture_limit"]
+        self.assertEqual(summary["lines"][0]["ignored"], 3)
+
+    def test_line_declaration_rejects_invalid_snapshot_limit_immediately(self) -> None:
+        self.space.close()
+
+        with self.assertRaisesRegex(TypeError, "must be an integer or None"):
+            spacetimepy.line(max_snapshots_per_line=1.5)
+
     def test_declaration_made_after_runtime_open_is_installed_immediately(self) -> None:
         @spacetimepy.function
         def calculate() -> int:

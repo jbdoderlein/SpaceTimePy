@@ -67,6 +67,27 @@ class TestSpaceTimeMonitor(DatabaseTestCase):
                 capture_lines=True,
             )
 
+    def test_line_limit_configuration_is_validated(self) -> None:
+        monitor = self.create_monitor()
+
+        def calculate() -> None:
+            return None
+
+        with self.assertRaisesRegex(TypeError, "must be an integer or None"):
+            monitor.register_capture(
+                calculate,
+                capture_lines=True,
+                max_snapshots_per_line=True,
+            )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            monitor.register_capture(
+                calculate,
+                capture_lines=True,
+                max_snapshots_per_line=0,
+            )
+        with self.assertRaisesRegex(ValueError, "requires line capture"):
+            monitor.register_capture(calculate, max_snapshots_per_line=1)
+
     def test_function_start_and_return_create_vm_call_and_step(self) -> None:
         monitor = self.create_monitor()
         branch = self.start_branch(monitor)
@@ -182,6 +203,67 @@ class TestSpaceTimeMonitor(DatabaseTestCase):
         self.assertEqual(len(steps), 1)
         self.assertEqual(steps[0].kind, StepKind.STACK_SNAPSHOT)
         self.assertEqual(steps[0].stack_snapshot.line_number, selected_line)
+
+    def test_line_limit_stores_first_snapshots_and_one_summary_per_call(self) -> None:
+        monitor = self.create_monitor()
+        self.start_branch(monitor, kind=StepKind.STACK_SNAPSHOT)
+        hook_lines: list[int] = []
+
+        def calculate(iterations: int) -> int:
+            total = 0
+            for index in range(iterations):
+                total += index
+                total *= 1
+            return total
+
+        def line_attributes(*args: object) -> dict[str, object]:
+            line_number = args[-1]
+            assert isinstance(line_number, int)
+            hook_lines.append(line_number)
+            return {"hook": True}
+
+        selected_lines = {
+            calculate.__code__.co_firstlineno + 3,
+            calculate.__code__.co_firstlineno + 4,
+        }
+        monitor.register_capture(
+            calculate,
+            role=CallRole.STEP,
+            capture_lines=True,
+            line_numbers=selected_lines,
+            max_snapshots_per_line=2,
+            line_attributes=line_attributes,
+        )
+
+        self.assertEqual(calculate(5), 10)
+        self.assertEqual(calculate(1), 0)
+        monitor.finish_branch()
+
+        calls = self.database.scalars(
+            select(FunctionCall).order_by(FunctionCall.id)
+        ).all()
+        steps = self.database.scalars(
+            select(ExecutionStep).order_by(ExecutionStep.position)
+        ).all()
+        self.assertEqual(len(steps), 6)
+        for selected_line in selected_lines:
+            self.assertEqual(hook_lines.count(selected_line), 3)
+        self.assertEqual(
+            calls[0].attributes["line_capture_limit"],
+            {
+                "maximum_per_line": 2,
+                "lines": [
+                    {
+                        "code_definition_id": calls[0].code_definition_id,
+                        "line_number": line_number,
+                        "captured": 2,
+                        "ignored": 3,
+                    }
+                    for line_number in sorted(selected_lines)
+                ],
+            },
+        )
+        self.assertNotIn("line_capture_limit", calls[1].attributes)
 
     def test_attribute_provider_errors_are_trace_data_not_program_errors(self) -> None:
         monitor = self.create_monitor()
