@@ -294,7 +294,7 @@ class SpaceTimeMonitor:
         )
         self._captures[code] = registration
 
-        # Source inspection and bytecode analysis are registration-time work,
+        # Root source inspection and bytecode analysis are registration-time work,
         # not costs to pay on the first monitored invocation.
         self._store_code_definition(code)
         self._global_names_for_code(code)
@@ -1769,13 +1769,46 @@ class SpaceTimeMonitor:
         code: types.CodeType,
         global_namespace: Mapping[str, Any],
     ) -> dict[str, Any]:
-        names = self._global_names_for_code(code)
+        globals_used: dict[str, Any] = {}
+        self._collect_used_globals(
+            code,
+            global_namespace,
+            globals_used,
+            processed=set(),
+        )
+        return globals_used
 
-        return {
-            name: global_namespace[name]
-            for name in names
-            if name in global_namespace
-        }
+    def _collect_used_globals(
+        self,
+        code: types.CodeType,
+        global_namespace: Mapping[str, Any],
+        globals_used: dict[str, Any],
+        *,
+        processed: set[tuple[types.CodeType, int]],
+    ) -> None:
+        """Collect data globals through the loaded Python function graph."""
+
+        analysis_key = (code, id(global_namespace))
+        if analysis_key in processed:
+            return
+        processed.add(analysis_key)
+
+        for name in self._global_names_for_code(code):
+            if name not in global_namespace:
+                continue
+
+            value = global_namespace[name]
+            if isinstance(value, types.FunctionType):
+                self._collect_used_globals(
+                    value.__code__,
+                    value.__globals__,
+                    globals_used,
+                    processed=processed,
+                )
+                continue
+            if isinstance(value, types.ModuleType):
+                continue
+            globals_used[name] = value
 
     def _global_names_for_code(self, code: types.CodeType) -> frozenset[str]:
         names = self._global_names_cache.get(code)

@@ -9,6 +9,7 @@ from spacetimepy.core.model import (
     ExecutionStep,
     FunctionCall,
     FunctionCallOutcome,
+    StackSnapshot,
     StepKind,
 )
 from spacetimepy.core.monitoring import (
@@ -18,6 +19,27 @@ from spacetimepy.core.monitoring import (
 )
 from spacetimepy.interface.data import TraceData
 from tests.support import DatabaseTestCase
+
+CALLED_FUNCTION_GLOBAL = {"source": "called function"}
+RECURSIVE_FUNCTION_GLOBAL = {"source": "recursive function"}
+
+
+def _read_called_function_global() -> str:
+    return CALLED_FUNCTION_GLOBAL["source"]
+
+
+def _call_global_reader() -> str:
+    return _read_called_function_global()
+
+
+def _recursive_global_a(depth: int) -> str:
+    return _recursive_global_b(depth - 1)
+
+
+def _recursive_global_b(depth: int) -> str:
+    if depth <= 0:
+        return RECURSIVE_FUNCTION_GLOBAL["source"]
+    return _recursive_global_a(depth)
 
 
 class TestSpaceTimeMonitor(DatabaseTestCase):
@@ -107,6 +129,57 @@ class TestSpaceTimeMonitor(DatabaseTestCase):
         self.assertEqual(values.load_references(call.entry_locals_refs), {"value": 4})
         self.assertIs(step.function_call, call)
         self.assertIs(step.branch, branch)
+
+    def test_entry_globals_include_globals_used_by_called_functions(self) -> None:
+        monitor = self.create_monitor()
+        self.start_branch(monitor)
+
+        monitor.register_capture(_call_global_reader, role=CallRole.STEP)
+        self.assertEqual(_call_global_reader(), "called function")
+        monitor.finish_branch()
+
+        call = self.database.scalars(select(FunctionCall)).one()
+        globals_used = TraceData(self.database).load_references(call.entry_globals_refs)
+        self.assertEqual(
+            globals_used,
+            {"CALLED_FUNCTION_GLOBAL": CALLED_FUNCTION_GLOBAL},
+        )
+
+    def test_line_globals_include_globals_used_by_called_functions(self) -> None:
+        monitor = self.create_monitor()
+        self.start_branch(monitor, kind=StepKind.STACK_SNAPSHOT)
+        selected_line = _call_global_reader.__code__.co_firstlineno + 1
+
+        monitor.register_capture(
+            _call_global_reader,
+            role=CallRole.STEP,
+            capture_lines=True,
+            line_numbers={selected_line},
+        )
+        self.assertEqual(_call_global_reader(), "called function")
+        monitor.finish_branch()
+
+        snapshot = self.database.scalars(select(StackSnapshot)).one()
+        globals_used = TraceData(self.database).load_references(snapshot.globals_refs)
+        self.assertEqual(
+            globals_used,
+            {"CALLED_FUNCTION_GLOBAL": CALLED_FUNCTION_GLOBAL},
+        )
+
+    def test_global_analysis_stops_at_recursive_function_cycles(self) -> None:
+        monitor = self.create_monitor()
+        self.start_branch(monitor)
+
+        monitor.register_capture(_recursive_global_a, role=CallRole.STEP)
+        self.assertEqual(_recursive_global_a(1), "recursive function")
+        monitor.finish_branch()
+
+        call = self.database.scalars(select(FunctionCall)).one()
+        globals_used = TraceData(self.database).load_references(call.entry_globals_refs)
+        self.assertEqual(
+            globals_used,
+            {"RECURSIVE_FUNCTION_GLOBAL": RECURSIVE_FUNCTION_GLOBAL},
+        )
 
     def test_raised_exception_is_recorded_without_being_swallowed(self) -> None:
         monitor = self.create_monitor()
