@@ -204,11 +204,49 @@ class ExternalInteractionScript:
         self._state.position = 0
         self._state.error = error
 
-    def mock(self, target: Callable[..., Any]) -> Callable[..., Any]:
-        """Build a simple replacement callable backed by this script."""
+    def matches(self, target: Callable[..., Any] | str) -> bool:
+        """Report whether the next recorded outcome belongs to ``target``."""
+
+        if self._state.error is not None:
+            return False
+        interaction = self.peek()
+        if interaction is None:
+            return False
+        return not self._recorded_names(interaction).isdisjoint(
+            self._target_names(target)
+        )
+
+    def call_live(
+        self,
+        target: Callable[..., Any],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Call the real target without recording the inner call."""
+
+        if self._active_runner is None:
+            return target(*args, **kwargs)
+        return self._active_runner(target, args, kwargs)
+
+    def mock(
+        self,
+        target: Callable[..., Any],
+        *,
+        live_fallback: bool = False,
+    ) -> Callable[..., Any]:
+        """Build a simple replacement callable backed by this script.
+
+        With ``live_fallback`` the replacement calls the real target whenever no
+        recorded outcome is available for it, either because the script is
+        exhausted or because the next recorded outcome belongs to another
+        target. The live call runs with capture suppressed so that only this
+        replacement is recorded as the replay branch's external interaction.
+        """
 
         @wraps(target)
         def replacement(*args: Any, **kwargs: Any) -> Any:
+            if live_fallback and not self.matches(target):
+                return self.call_live(target, args, kwargs)
             del args, kwargs
             return self.take(target)
 
