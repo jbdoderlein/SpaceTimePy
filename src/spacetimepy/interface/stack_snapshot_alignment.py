@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import textwrap
-from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +13,7 @@ from code_diff.gumtree import (
     gumtree_editmap,
     gumtree_isomap,
 )
+from code_diff.gumtree.ops import Move, Update
 
 from .alignment import (
     AlignmentError,
@@ -110,22 +110,6 @@ class CodeDiffLineMapper:
         )
         target_lines = tuple(range(target_start, target_start + len(target_content)))
 
-        if reference_source == target_source:
-            correspondences = tuple(
-                CodeLineCorrespondence(
-                    reference_start + offset,
-                    target_start + offset,
-                    AlignmentRelation.MATCH,
-                )
-                for offset in range(min(len(reference_content), len(target_content)))
-            )
-            return CodeLineMapping(
-                reference_lines,
-                target_lines,
-                correspondences,
-                (),
-            )
-
         try:
             reference_tree = _python_tree(reference_source)
             target_tree = _python_tree(target_source)
@@ -134,7 +118,8 @@ class CodeDiffLineMapper:
                 reference_tree,
                 target_tree,
             )
-            mapped_nodes = tuple(node_mapping)
+            # Preserve the original matches before the edit script adds inserted nodes.
+            mapped_nodes = dict(node_mapping)
             edit_script = tuple(
                 compute_chawathe_edit_script(
                     node_mapping,
@@ -149,55 +134,62 @@ class CodeDiffLineMapper:
                 f"{target.qualified_name or target.name!r}: {error}"
             ) from error
 
-        votes: Counter[tuple[int, int]] = Counter()
-        for reference_node, target_node in mapped_nodes:
+        # AST iteration visits parents before children in a fixed breadth-first order.
+        # Thus, a statement claims its starting line before its subexpressions.
+        selected_reference_rows: set[int] = set()
+        selected_target_rows: set[int] = set()
+        line_pairs: list[tuple[int, int]] = []
+        for reference_node in reference_tree:
+            target_node = mapped_nodes.get(reference_node)
+            if target_node is None:
+                continue
             reference_row = _start_row(reference_node)
             target_row = _start_row(target_node)
             if (
                 reference_row is None
                 or target_row is None
-                or reference_row >= len(reference_content)
-                or target_row >= len(target_content)
-            ):
-                continue
-            weight = (
-                3 if not reference_node.children and not target_node.children else 1
-            )
-            votes[reference_row, target_row] += weight
-
-        selected_reference_rows: set[int] = set()
-        selected_target_rows: set[int] = set()
-        correspondences: list[CodeLineCorrespondence] = []
-        candidates = sorted(
-            votes,
-            key=lambda pair: (
-                -votes[pair],
-                reference_content[pair[0]] != target_content[pair[1]],
-                abs(pair[0] - pair[1]),
-                pair[0],
-                pair[1],
-            ),
-        )
-        for reference_row, target_row in candidates:
-            if (
-                reference_row in selected_reference_rows
+                or not 0 <= reference_row < len(reference_content)
+                or not 0 <= target_row < len(target_content)
+                or reference_row in selected_reference_rows
                 or target_row in selected_target_rows
             ):
                 continue
             selected_reference_rows.add(reference_row)
             selected_target_rows.add(target_row)
-            relation = (
-                AlignmentRelation.MATCH
-                if reference_content[reference_row] == target_content[target_row]
-                else AlignmentRelation.UPDATED
-            )
-            correspondences.append(
-                CodeLineCorrespondence(
-                    reference_start + reference_row,
-                    target_start + target_row,
-                    relation,
+            line_pairs.append((reference_row, target_row))
+
+        # Unmatched nodes identify deleted and inserted constructs in their own AST.
+        # Insert.target_node identifies a parent, not the inserted construct.
+        mapped_targets = set(mapped_nodes.values())
+        changed_reference_rows = {
+            _start_row(node) for node in reference_tree if node not in mapped_nodes
+        }
+        changed_target_rows = {
+            _start_row(node) for node in target_tree if node not in mapped_targets
+        }
+        for operation in edit_script:
+            if isinstance(operation, Update | Move):
+                reference_node = (
+                    operation.node
+                    if isinstance(operation, Move)
+                    else operation.target_node
                 )
+                target_node = mapped_nodes.get(reference_node)
+                if target_node is not None:
+                    changed_reference_rows.add(_start_row(reference_node))
+                    changed_target_rows.add(_start_row(target_node))
+
+        correspondences = [
+            CodeLineCorrespondence(
+                reference_start + reference_row,
+                target_start + target_row,
+                AlignmentRelation.UPDATED
+                if reference_row in changed_reference_rows
+                or target_row in changed_target_rows
+                else AlignmentRelation.MATCH,
             )
+            for reference_row, target_row in line_pairs
+        ]
 
         correspondences.sort(key=lambda item: item.reference_line)
         return CodeLineMapping(
