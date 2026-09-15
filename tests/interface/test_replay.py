@@ -81,6 +81,37 @@ class TestReplayInterface(SpaceTimeTestCase):
         self.assertEqual(context.options, {"mock_external": True})
         self.assertEqual(before, after)
 
+    def test_prepare_active_execution_materializes_captured_values(self) -> None:
+        contexts = []
+
+        def prepare(frame, values):
+            values.append(99)
+            contexts.append(self.space.replay.prepare_active_execution(source_frame=frame))
+
+        def original(values):
+            prepare(inspect.currentframe(), values)
+
+        original = self.space.capture.line(original)
+        values = [7]
+        with self.space.capture.recording(mode="line") as recording:
+            original(values)
+        context = contexts[0]
+        self.assertEqual(context.locals["values"], [7])
+        self.assertIsNot(context.locals["values"], values)
+        self.assertEqual(context.parent_branch_id, recording.branch_id)
+        self.assertEqual(context.branch_id, -1)
+        self.assertEqual(len(self.space.data.get_session(recording.session_id).branches), 1)
+
+    def test_prepare_active_execution_requires_an_active_captured_frame(self) -> None:
+        frame = inspect.currentframe()
+        with self.assertRaisesRegex(ReplayError, "No SpaceTime recording"):
+            self.space.replay.prepare_active_execution(source_frame=frame)
+        with (
+            self.space.capture.recording(mode="line"),
+            self.assertRaisesRegex(ReplayError, "no recorded step"),
+        ):
+            self.space.replay.prepare_active_execution(source_frame=frame)
+
     def test_external_script_validates_order_and_can_build_a_mock(self) -> None:
         _, branch, source, read_external = self.record_external_step()
         context = self.space.replay.prepare(

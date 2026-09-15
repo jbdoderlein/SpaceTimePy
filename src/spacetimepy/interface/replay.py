@@ -416,6 +416,27 @@ class ReplayInterface:
             alignment_policy=alignment_policy,
         )
 
+    def prepare_active_execution(self, *, source_frame: FrameType) -> ReplayContext:
+        """Load the captured state of an active frame without creating a branch.
+
+        Resolve the frame in the current recording branch. Flush pending
+        captures before loading stored values. Fail if no captured step exists.
+        """
+
+        branch = self._monitor.current_branch
+        if branch is None or self._monitor.current_session is None:
+            raise ReplayError("No SpaceTime recording is active")
+        self._monitor.flush()
+        step = self._monitor.active_step_for_frame(source_frame)
+        if branch.id is None:
+            raise ReplayError("The active branch has no persistent ID")
+        if step is None or step.id is None:
+            raise ReplayError("The active frame has no recorded step to prepare")
+        return self.prepare(
+            parent_branch_id=branch.id,
+            forked_from_step_id=step.id,
+        )
+
     def begin(
         self,
         *,
@@ -507,8 +528,7 @@ class ReplayInterface:
             and self._active_context.branch_id != active_branch.id
         ):
             raise ReplayError("Another SpaceTime replay is already active")
-        if active_branch.id is None:
-            self._monitor.flush()
+        self._monitor.flush()
         if active_branch.id is None:
             raise ReplayError("The active branch has no persistent ID")
 
